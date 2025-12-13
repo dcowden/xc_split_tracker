@@ -1,0 +1,276 @@
+#include <Arduino.h>
+#include <Adafruit_TinyUSB.h>
+#include <nrf.h>
+
+#include <Wire.h>
+#include <SPI.h>
+#include <ArduinoLog.h>
+#include <RTClib.h>
+#include <Ticker.h>
+
+#include "config.h"
+#include "types.h"
+#include "radio_input.h"
+#include "sd_logger.h"
+#include "display.h"
+#include "pass_processor.h"
+#include "rtc_time.h"
+
+// ======================================================================
+// GLOBAL CONFIG / STATE
+// ======================================================================
+
+RuntimeConfig g_cfg = {
+    .ema_alpha          = 0.2f,
+    .pass_timeout_ms    = 800,
+    .approach_threshold = -80,
+};
+
+TagContext g_tags[MAX_TAGS];
+
+// Total events (incremented inside pass_processor via pass_emit_event)
+volatile uint32_t g_total_events  = 0;
+// Total raw samples observed
+volatile uint32_t g_total_samples = 0;
+
+// Forward decl so Ticker can call it
+static void display_update_cb();
+
+// Ticker: 500 ms display refresh, using millis()
+Ticker g_display_ticker(display_update_cb, 500, 0, MILLIS);
+
+// ======================================================================
+// RADIO PACKET FORMAT + IRQ
+// ======================================================================
+
+#define PACKET_LEN 4
+
+typedef struct __attribute__((packed)) {
+    uint8_t  tag_id;
+    uint8_t  seq;
+    uint16_t reserved;
+} xc_packet_t;
+
+// Live buffer used by RADIO
+static volatile xc_packet_t rx_packet;
+
+extern "C" void RADIO_IRQHandler(void) {
+    if (NRF_RADIO->EVENTS_READY) {
+        NRF_RADIO->EVENTS_READY = 0;
+        NRF_RADIO->TASKS_START  = 1;
+    }
+
+    if (NRF_RADIO->EVENTS_END) {
+        NRF_RADIO->EVENTS_END = 0;
+
+        if (NRF_RADIO->CRCSTATUS == 1) {
+            int8_t   rssi   = (int8_t)NRF_RADIO->RSSISAMPLE;
+            uint32_t now_ms = millis();  // timestamp at RX end
+
+            // Minimal work in ISR: push into ring buffer
+            radio_on_packet_isr(rx_packet.tag_id, rssi, now_ms);
+        }
+
+        // Keep listening
+        NRF_RADIO->TASKS_START = 1;
+    }
+}
+
+static void radio_init_rx() {
+    NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
+    NRF_CLOCK->TASKS_HFCLKSTART    = 1;
+    while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0) { }
+
+    NRF_RADIO->PREFIX0     = 0x12UL;
+    NRF_RADIO->BASE0       = 0x89ABCDEFUL;
+    NRF_RADIO->TXADDRESS   = 0;
+    NRF_RADIO->RXADDRESSES = (1 << 0);
+
+    NRF_RADIO->FREQUENCY = 80;
+
+    NRF_RADIO->MODE = (RADIO_MODE_MODE_Nrf_1Mbit << RADIO_MODE_MODE_Pos);
+
+    NRF_RADIO->PCNF0 =
+        (0 << RADIO_PCNF0_S0LEN_Pos) |
+        (0 << RADIO_PCNF0_S1LEN_Pos) |
+        (0 << RADIO_PCNF0_LFLEN_Pos);
+
+    NRF_RADIO->PCNF1 =
+        (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos) |
+        (4 << RADIO_PCNF1_BALEN_Pos) |
+        (PACKET_LEN << RADIO_PCNF1_STATLEN_Pos) |
+        (PACKET_LEN << RADIO_PCNF1_MAXLEN_Pos);
+
+    NRF_RADIO->CRCCNF  = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
+    NRF_RADIO->CRCINIT = 0xFFFFUL;
+    NRF_RADIO->CRCPOLY = 0x11021UL;
+
+    NRF_RADIO->PACKETPTR = (uint32_t)&rx_packet;
+
+    NRF_RADIO->SHORTS = RADIO_SHORTS_ADDRESS_RSSISTART_Msk;
+
+    NRF_RADIO->INTENSET = RADIO_INTENSET_READY_Msk | RADIO_INTENSET_END_Msk;
+    NVIC_ClearPendingIRQ(RADIO_IRQn);
+    NVIC_SetPriority(RADIO_IRQn, 2);
+    NVIC_EnableIRQ(RADIO_IRQn);
+
+    NRF_RADIO->TASKS_RXEN = 1;
+}
+
+// ======================================================================
+// EVENT SINK → SD + SERIAL
+// ======================================================================
+
+static void on_event(const Event &e) {
+    // g_total_events should be incremented in pass_emit_event()
+
+    uint32_t unix_ts = RtcTime::rel_ms_to_unix(e.rel_ms);
+
+    SdLogger::log_event(unix_ts, e);
+
+    Serial.print(F("EV,"));
+    Serial.print(unix_ts);
+    Serial.print(',');
+    Serial.print(e.tag_id);
+    Serial.print(',');
+    Serial.print(e.pass_id);
+    Serial.print(',');
+    Serial.print((int)e.rssi);
+    Serial.print(',');
+    Serial.println((int)e.type);
+
+    if (Serial1) {
+        Serial1.print(F("EV,"));
+        Serial1.print(unix_ts);
+        Serial1.print(',');
+        Serial1.print(e.tag_id);
+        Serial1.print(',');
+        Serial1.print(e.pass_id);
+        Serial1.print(',');
+        Serial1.print((int)e.rssi);
+        Serial1.print(',');
+        Serial1.println((int)e.type);
+    }
+}
+
+// ======================================================================
+// PER-MESSAGE ACTIONS
+// ======================================================================
+
+static void log_debug_usb(const Measurement &m)
+{
+    Serial.print(F("RAW,"));
+    Serial.print(m.rel_ms);
+    Serial.print(',');
+    Serial.print(m.tag_id);
+    Serial.print(',');
+    Serial.println((int)m.rssi);
+
+    Serial.print(F(">rssi:"));
+    Serial.println((int)m.rssi);
+}
+
+static void log_serial1_hw(const Measurement &m)
+{
+    if (!Serial1) return;
+
+    Serial1.print(F("RAW,"));
+    Serial1.print(m.rel_ms);
+    Serial1.print(',');
+    Serial1.print(m.tag_id);
+    Serial1.print(',');
+    Serial1.println((int)m.rssi);
+}
+
+static void log_raw_to_sd(const Measurement &m)
+{
+    uint32_t pass_id = 0;
+
+    if (TagContext *ctx = pass_get_ctx(m.tag_id)) {
+        if (ctx->in_pass) {
+            pass_id = ctx->pass_id;
+        }
+    }
+
+    uint32_t unix_ts = RtcTime::rel_ms_to_unix(m.rel_ms);
+    SdLogger::log_raw_sample(unix_ts, m.tag_id, pass_id, m.rssi);
+}
+
+static void update_pass_state(const Measurement &m)
+{
+    pass_process_sample(m, m.rel_ms);
+}
+
+// ======================================================================
+// PROCESSING PHASES
+// ======================================================================
+
+static void process_messages()
+{
+    Measurement m;
+
+    while (radio_pop_measurement(m)) {
+        g_total_samples++;
+
+        log_serial1_hw(m);
+        log_debug_usb(m);
+        log_raw_to_sd(m);
+        update_pass_state(m);
+    }
+}
+
+// ======================================================================
+// DISPLAY TICKER CALLBACK
+// ======================================================================
+
+static void display_update_cb()
+{
+    StatusDisplay::update(
+        g_total_events,
+        g_total_samples,
+        pass_get_tag_count()
+    );
+}
+
+// ======================================================================
+// SETUP / LOOP
+// ======================================================================
+
+void setup() {
+    Serial.begin(115200);
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 2000)) {
+        delay(10);
+    }
+
+    Log.begin(LOG_LEVEL_VERBOSE, &Serial);
+    Log.noticeln(F("XC logger on XIAO nRF52840 (radio RX, RTC+millis timing)"));
+
+    Serial1.begin(460800);
+
+    RtcTime::init();
+
+    if (!SdLogger::init()) {
+        Log.errorln(F("SD init failed – continuing without SD logging"));
+    }
+
+    StatusDisplay::init();
+
+    pass_init();
+    pass_set_event_sink(on_event);
+
+    radio_init_rx();
+
+    g_display_ticker.start();
+}
+
+void loop() {
+    uint32_t now_ms = millis();
+
+    process_messages();
+    pass_check_timeouts(now_ms);
+    SdLogger::service();
+    g_display_ticker.update();
+
+    delay(1);
+}

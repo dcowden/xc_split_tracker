@@ -1,0 +1,971 @@
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <FS.h>
+#include <SD_MMC.h>
+#include <ArduinoLog.h>
+#include <math.h>
+#include <esp_system.h>
+#include "esp_heap_caps.h"
+#include <WiFi.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <time.h>
+
+// -----------------------------------------------------
+// UART + LOGGING CONFIG
+// -----------------------------------------------------
+
+constexpr uint32_t EXT_BAUD   = 460800;
+constexpr size_t   EXT_RX_BUF = 4096;
+
+// Use UART2 on GPIO16 for external receiver (nRF52840)
+constexpr int UART_NUM   = 2;
+constexpr int UART_RXPIN = 16;
+constexpr int UART_TXPIN = -1;   // not used
+
+// SD_MMC config (onboard slot, 1-bit mode)
+static const bool SDMMC_1BIT = true;
+
+// I2C for DS3231
+constexpr int I2C_SDA_PIN = 4;
+constexpr int I2C_SCL_PIN = 13;
+
+// WiFi credentials
+static const char *WIFI_SSID = "bluedirt_IOT_2G";
+static const char *WIFI_PSK  = "allthethings!";
+
+// timing log threshold (us)
+constexpr uint32_t LOG_TIME_THRESHOLD_US = 20000;  // 20 ms
+
+// Raw write stall warning threshold (for SD writer task)
+constexpr uint32_t RAW_WRITE_WARN_US = 50000;      // 50 ms
+
+// flush policy (we'll use time-based flush for the buffered logger)
+constexpr uint32_t FLUSH_TIME_INTERVAL_MS = 2000;  // flush every 2 seconds
+
+// toggle verbose per-event printing
+#define VERBOSE_EVENT_LOG 0
+
+// =====================================================
+// TIMING HELPERS
+// =====================================================
+
+static inline uint32_t t_start() {
+    return micros();
+}
+
+static inline void t_log(const char *label, uint32_t start_us) {
+    uint32_t dur = micros() - start_us;
+    if (dur >= LOG_TIME_THRESHOLD_US) {
+        Log.notice("%s took %lu us (%lu ms)\n",
+                   label,
+                   (unsigned long)dur,
+                   (unsigned long)(dur / 1000));
+    }
+}
+
+void log_heap(const char* where) {
+    Log.notice("heap(%s) = %u\n", where, (unsigned)ESP.getFreeHeap());
+    Log.notice(F("Free heap (caps): %u\n"),
+               (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+}
+
+// =====================================================
+// RTC
+// =====================================================
+
+RTC_DS3231 g_rtc;
+bool       g_rtc_ok = false;
+
+// Try to connect WiFi, fetch NTP time, set DS3231, then turn WiFi off
+bool sync_rtc_from_wifi() {
+    Log.notice(F("RTC sync: starting WiFi to get NTP time...\n"));
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PSK);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000) {
+        delay(500);
+        Log.notice(F("."));
+    }
+    Log.notice(F("\n"));
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Log.warningln(F("RTC sync: WiFi connect FAILED"));
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+
+    Log.notice("RTC sync: WiFi connected, IP=%s\n",
+               WiFi.localIP().toString().c_str());
+
+    // Get UTC time from NTP
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+    struct tm timeinfo;
+    bool got = false;
+    start = millis();
+    while ((millis() - start) < 15000 && !got) {
+        if (getLocalTime(&timeinfo)) {
+            got = true;
+        } else {
+            delay(500);
+        }
+    }
+
+    if (!got) {
+        Log.errorln(F("RTC sync: failed to get NTP time"));
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+
+    time_t now = mktime(&timeinfo);
+
+    // Init I2C + RTC and set time
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    if (!g_rtc.begin()) {
+        Log.errorln(F("RTC sync: DS3231 not found on I2C"));
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+
+    g_rtc.adjust(DateTime(now));
+    g_rtc_ok = true;
+
+    DateTime dt = g_rtc.now();
+    Log.notice("RTC sync: RTC set to %04d-%02d-%02d %02d:%02d:%02d (UTC)\n",
+               dt.year(), dt.month(), dt.day(),
+               dt.hour(), dt.minute(), dt.second());
+
+    // Clean up WiFi
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Log.noticeln(F("RTC sync: WiFi turned off"));
+
+    return true;
+}
+
+// =====================================================
+// TAG / PASS CONFIG
+// =====================================================
+
+struct Config {
+    float    ema_alpha;          // 0..1
+    uint32_t timeout_ms;         // legacy timeout (used before dynamic window kicks in)
+    int8_t   approach_threshold; // EMA above this => APPROACHING / IN-PASS (dynamic after 1st pass)
+
+    // NEW: window based on distance + assumed 5k pace
+    float    look_distance_m;    // how many meters out we want to look (e.g. 20 m)
+    float    pace_5k_min;        // assumed 5k time in minutes (e.g. 20.0)
+};
+
+Config g_cfg = {
+    .ema_alpha          = 0.3f,
+    .timeout_ms         = 1000,    // used until dynamic window is established
+    .approach_threshold = -80,     // start very low so we don't miss early runners
+    .look_distance_m    = 20.0f,   // configurable: how far out to start watching (meters)
+    .pace_5k_min        = 20.0f,   // configurable: 5k time in minutes
+};
+
+// NEW: global dynamic-window state
+bool     g_dynamic_window_enabled = false;
+uint32_t g_window_half_ms         = 0;   // half-window around TCA in ms (time from threshold to TCA)
+
+// =====================================================
+// BASIC TYPES
+// =====================================================
+
+struct Measurement {
+    uint32_t rel_ts;    // relative timestamp from sender (ms)
+    uint16_t tag_id;
+    int8_t   rssi;
+    float    ema_fwd;   // for zero-phase peak calc
+};
+
+enum EventType : uint8_t {
+    EVENT_APPROACHING = 1,
+    EVENT_PEAK        = 2,
+    EVENT_FINISHED    = 3,
+};
+
+struct Event {
+    uint32_t  rel_ts;   // rel time of event (ms)
+    uint32_t  pass_id;
+    uint16_t  tag_id;
+    EventType type;
+    int8_t    rssi;     // EMA or peak rssi at that moment
+};
+
+// =====================================================
+// PER-TAG CONTEXT / STATE MACHINE (NO STL)
+// =====================================================
+
+// Shrunk to fit DRAM
+constexpr int MAX_TAGS             = 2;
+constexpr int MAX_SAMPLES_PER_PASS = 1500;
+constexpr int MAX_EVENTS_PER_PASS  = 8;
+
+struct TagContext {
+    bool     used        = false;
+    uint16_t tag_id      = 0;
+
+    bool     in_pass     = false;
+    uint32_t pass_id     = 0;
+
+    float    ema         = 0.0f;
+    bool     ema_init    = false;
+
+    int8_t   last_rssi   = 0;
+    uint32_t last_rel_ts = 0;     // from data stream
+    uint32_t last_wall_ms= 0;     // millis() when we processed last sample
+
+    // NEW: track when this pass started
+    uint32_t pass_start_rel_ts = 0;   // rel_ts at APPROACHING
+    uint32_t pass_start_wall_ms= 0;   // millis() when pass started
+
+    // Samples for this pass
+    Measurement samples[MAX_SAMPLES_PER_PASS];
+    uint16_t    sample_count = 0;
+
+    // Events for this pass
+    Event       events[MAX_EVENTS_PER_PASS];
+    uint8_t     event_count  = 0;
+};
+
+TagContext g_tags[MAX_TAGS];
+uint8_t    g_tag_count = 0;
+
+// =====================================================
+// GLOBALS
+// =====================================================
+
+HardwareSerial ExtSerial(UART_NUM);
+uint32_t g_next_pass_id = 1;
+
+// SD_MMC logger state
+bool g_sdOk = false;
+
+// =====================================================
+// BUFFERED LOGGER (hamsternz-style, CSV)
+// =====================================================
+
+// Shrunk to reduce DRAM
+#define N_BUFFERS   3
+#define BUFFER_SIZE 4096
+
+struct LogBuffer {
+    size_t  len;
+    uint8_t data[BUFFER_SIZE];
+};
+
+struct BufferedLogger {
+    const char    *filename;
+    LogBuffer      buffers[N_BUFFERS];
+    size_t         cur_idx;
+    size_t         cur_pos;
+    QueueHandle_t  queue;        // buffer indices ready to write
+    TaskHandle_t   task_handle;  // writer task
+};
+
+BufferedLogger raw_logger   = { "/raw.csv"    };
+BufferedLogger event_logger = { "/events.csv" };
+
+// Forward
+void logger_task(void *arg);
+
+void init_logger(BufferedLogger &log) {
+    log.cur_idx = 0;
+    log.cur_pos = 0;
+    for (int i = 0; i < N_BUFFERS; ++i) {
+        log.buffers[i].len = 0;
+    }
+
+    log.queue = xQueueCreate(N_BUFFERS, sizeof(size_t));
+    if (!log.queue) {
+        Log.errorln(F("Failed to create logger queue"));
+    }
+
+    xTaskCreatePinnedToCore(
+        logger_task,
+        "logger_task",
+        4096,
+        &log,
+        1,
+        &log.task_handle,
+        1   // run on core 1
+    );
+}
+
+// Buffer writes; called from main context
+void logger_write(BufferedLogger &log, const uint8_t *data, size_t len) {
+    if (!g_sdOk) return;
+
+    while (len > 0) {
+        size_t space = BUFFER_SIZE - log.cur_pos;
+        if (space == 0) {
+            // enqueue current full buffer
+            log.buffers[log.cur_idx].len = log.cur_pos;
+            size_t idx_to_write = log.cur_idx;
+            if (xQueueSend(log.queue, &idx_to_write, 0) != pdPASS) {
+                Log.warningln(F("Logger queue full; dropping buffer"));
+            }
+            log.cur_idx = (log.cur_idx + 1) % N_BUFFERS;
+            log.cur_pos = 0;
+            space       = BUFFER_SIZE;
+        }
+
+        size_t chunk = (len < space) ? len : space;
+        memcpy(&log.buffers[log.cur_idx].data[log.cur_pos], data, chunk);
+        log.cur_pos += chunk;
+        data        += chunk;
+        len         -= chunk;
+    }
+}
+
+void logger_flush(BufferedLogger &log) {
+    if (!g_sdOk) return;
+    if (log.cur_pos == 0) return;
+
+    log.buffers[log.cur_idx].len = log.cur_pos;
+    size_t idx_to_write = log.cur_idx;
+    if (xQueueSend(log.queue, &idx_to_write, pdMS_TO_TICKS(100)) == pdPASS) {
+        log.cur_idx = (log.cur_idx + 1) % N_BUFFERS;
+        log.cur_pos = 0;
+    }
+}
+
+// Writer task: waits for buffers and writes them to SD_MMC
+void logger_task(void *arg) {
+    BufferedLogger *log = (BufferedLogger *)arg;
+
+    File f = SD_MMC.open(log->filename, FILE_APPEND);
+    if (!f) {
+        Log.error(F("Failed to open log file: %s\n"), log->filename);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Write header if file is empty
+    if (f.size() == 0) {
+        if (strcmp(log->filename, "/raw.csv") == 0) {
+            f.println(F("rel_ts,tag_id,rssi"));
+        } else if (strcmp(log->filename, "/events.csv") == 0) {
+            f.println(F("rel_ts,pass_id,tag_id,event_id,rssi"));
+        }
+        f.flush();
+    }
+
+    Log.notice(F("Logger started for %s\n"), log->filename);
+
+    for (;;) {
+        size_t idx;
+        if (xQueueReceive(log->queue, &idx, portMAX_DELAY) == pdTRUE) {
+            LogBuffer &buf = log->buffers[idx];
+            if (buf.len > 0) {
+                uint32_t t0 = t_start();
+                size_t written = f.write(buf.data, buf.len);
+                uint32_t dur = micros() - t0;
+                if (dur >= RAW_WRITE_WARN_US) {
+                    Log.warning("SD write on %s took %lu us (%lu ms), size=%u\n",
+                                log->filename,
+                                (unsigned long)dur,
+                                (unsigned long)(dur / 1000),
+                                (unsigned)buf.len);
+                }
+                if (written != buf.len) {
+                    Log.error("SD write error on %s: wrote %u of %u bytes\n",
+                              log->filename,
+                              (unsigned)written,
+                              (unsigned)buf.len);
+                }
+                f.flush();  // can be relaxed if needed
+                buf.len = 0;
+            }
+        }
+    }
+}
+
+// Convenience wrappers for CSV lines
+void log_raw_line(const String &s) {
+    String line = s;
+    if (!line.endsWith("\n")) line += "\n";
+    logger_write(raw_logger, (const uint8_t *)line.c_str(), line.length());
+}
+
+void log_event_line(const String &s) {
+    String line = s;
+    if (!line.endsWith("\n")) line += "\n";
+    logger_write(event_logger, (const uint8_t *)line.c_str(), line.length());
+}
+
+// =====================================================
+// SD_MMC INIT
+// =====================================================
+
+bool initSDMMC() {
+    uint32_t t0 = t_start();
+
+    Log.notice(F("initSDMMC: calling SD_MMC.begin...\n"));
+    if (!SD_MMC.begin("/sdcard", SDMMC_1BIT)) {
+        t_log("SD_MMC.begin", t0);
+        Log.errorln(F("SD_MMC init FAILED"));
+        g_sdOk = false;
+        return false;
+    }
+    t_log("SD_MMC.begin", t0);
+    Log.noticeln(F("SD_MMC init OK"));
+    log_heap("after SD_MMC.begin");
+
+    g_sdOk = true;
+    return true;
+}
+
+// =====================================================
+// TAG CONTEXT MANAGEMENT (NO VECTORS)
+// =====================================================
+
+TagContext* get_or_create_tag_ctx(uint16_t tag_id) {
+    uint32_t t0 = t_start();
+
+    // find existing
+    for (int i = 0; i < MAX_TAGS; ++i) {
+        if (g_tags[i].used && g_tags[i].tag_id == tag_id) {
+            t_log("get_or_create_tag_ctx (existing)", t0);
+            return &g_tags[i];
+        }
+    }
+
+    // create new
+    for (int i = 0; i < MAX_TAGS; ++i) {
+        if (!g_tags[i].used) {
+            g_tags[i].used   = true;
+            g_tags[i].tag_id = tag_id;
+            g_tags[i].in_pass = false;
+            g_tags[i].pass_id = 0;
+            g_tags[i].ema_init = false;
+            g_tags[i].sample_count = 0;
+            g_tags[i].event_count  = 0;
+            g_tags[i].pass_start_rel_ts = 0;
+            g_tags[i].pass_start_wall_ms= 0;
+            g_tag_count++;
+
+            Log.notice(F("Created TagContext for tag %u (total tags=%d)\n"),
+                       (unsigned)tag_id,
+                       (int)g_tag_count);
+            t_log("get_or_create_tag_ctx (new)", t0);
+            log_heap("after new TagContext");
+            return &g_tags[i];
+        }
+    }
+
+    Log.errorln(F("No free TagContext slots!"));
+    return nullptr;
+}
+
+// =====================================================
+// CSV PARSER
+// =====================================================
+
+bool parseCSV(const String &line, Measurement &m) {
+    int c1 = line.indexOf(',');
+    if (c1 < 0) return false;
+    int c2 = line.indexOf(',', c1 + 1);
+    if (c2 < 0) return false;
+
+    String s_ts   = line.substring(0, c1);
+    String s_tag  = line.substring(c1 + 1, c2);
+    String s_rssi = line.substring(c2 + 1);
+
+    s_ts.trim();
+    s_tag.trim();
+    s_rssi.trim();
+
+    long ts   = s_ts.toInt();
+    long tag  = s_tag.toInt();
+    long rssi = s_rssi.toInt();
+
+    m.rel_ts = (uint32_t)ts;
+    m.tag_id = (uint16_t)tag;
+    m.rssi   = (int8_t)rssi;
+    m.ema_fwd = 0.0f;
+    return true;
+}
+
+// =====================================================
+// DYNAMIC WINDOW CALC (distance -> time, then RSSI threshold)
+// =====================================================
+
+static inline float compute_nominal_speed_mps() {
+    // 5k = 5000 m, pace_5k_min minutes
+    if (g_cfg.pace_5k_min <= 0.0f) return 0.0f;
+    float total_seconds = g_cfg.pace_5k_min * 60.0f;
+    return 5000.0f / total_seconds;   // m/s
+}
+
+// Use one finished pass to:
+///  - find TCA (peak_rel_ts, already computed)
+///  - map look_distance_m using nominal speed to a time Δt
+///  - use RSSI (EMA) at (TCA - Δt) as new threshold
+///  - set window_half_ms = Δt (so window length ~ 2·Δt)
+void update_dynamic_window_from_pass(TagContext &ctx, uint32_t peak_rel_ts) {
+    if (ctx.sample_count < 3) {
+        Log.warningln(F("Dynamic window: not enough samples to update"));
+        return;
+    }
+    if (g_cfg.look_distance_m <= 0.0f) {
+        Log.warningln(F("Dynamic window: look_distance_m <= 0, skipping"));
+        return;
+    }
+
+    float v_mps = compute_nominal_speed_mps();
+    if (v_mps <= 0.0f) {
+        Log.warningln(F("Dynamic window: invalid nominal speed, skipping"));
+        return;
+    }
+
+    // Time Δt to cover look_distance_m at nominal speed
+    float half_seconds = g_cfg.look_distance_m / v_mps;    // s
+    uint32_t half_ms   = (uint32_t)lroundf(half_seconds * 1000.0f);
+    if (half_ms < 500) half_ms = 500;  // sanity floor (0.5s)
+
+    // Target timestamp = TCA - Δt (can't go below first sample)
+    uint32_t target_ts = (peak_rel_ts > half_ms)
+                           ? (peak_rel_ts - half_ms)
+                           : ctx.samples[0].rel_ts;
+
+    // Find sample with rel_ts closest to target_ts
+    uint16_t best_idx  = 0;
+    uint32_t best_diff = UINT32_MAX;
+    for (uint16_t i = 0; i < ctx.sample_count; ++i) {
+        uint32_t ts   = ctx.samples[i].rel_ts;
+        uint32_t diff = (ts > target_ts) ? (ts - target_ts) : (target_ts - ts);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx  = i;
+        }
+    }
+
+    // We already have forward EMA stored in ema_fwd from compute_zero_phase_peak
+    float  ema_at_target  = ctx.samples[best_idx].ema_fwd;
+    int8_t new_threshold  = (int8_t)lrintf(ema_at_target);
+
+    // Update global dynamic settings
+    g_cfg.approach_threshold   = new_threshold;
+    g_window_half_ms           = half_ms;
+    g_dynamic_window_enabled   = true;
+
+    Log.notice("Dynamic window updated: look=%.1fm, pace_5k=%.1fmin, half=%lums, new_threshold=%d dBm (sample idx=%u, rel_ts=%lu)\n",
+               g_cfg.look_distance_m,
+               g_cfg.pace_5k_min,
+               (unsigned long)g_window_half_ms,
+               (int)g_cfg.approach_threshold,
+               (unsigned)best_idx,
+               (unsigned long)ctx.samples[best_idx].rel_ts);
+}
+
+
+// =====================================================
+// ZERO-PHASE PEAK FINDER (NO HEAP ALLOCATIONS)
+// =====================================================
+
+void compute_zero_phase_peak(TagContext &ctx,
+                             float alpha,
+                             uint32_t &peak_rel_ts,
+                             float &peak_val) {
+    uint32_t t0 = t_start();
+
+    const uint16_t n = ctx.sample_count;
+    if (n < 3) {
+        t_log("compute_zero_phase_peak (too few samples)", t0);
+        return;
+    }
+
+    const float one_minus_alpha = 1.0f - alpha;
+
+    // forward EMA stored in each Measurement::ema_fwd
+    for (uint16_t i = 0; i < n; ++i) {
+        float x = (float)ctx.samples[i].rssi;
+        if (i == 0) {
+            ctx.samples[0].ema_fwd = x;
+        } else {
+            ctx.samples[i].ema_fwd =
+                alpha * x + one_minus_alpha * ctx.samples[i - 1].ema_fwd;
+        }
+    }
+
+    // backward EMA over forward EMA, track max on the fly
+    float back_val = ctx.samples[n - 1].ema_fwd;
+    float max_val  = back_val;
+    uint16_t peak_idx = n - 1;
+
+    for (int i = (int)n - 2; i >= 0; --i) {
+        back_val = alpha * ctx.samples[i].ema_fwd +
+                   one_minus_alpha * back_val;
+        if (back_val > max_val) {
+            max_val  = back_val;
+            peak_idx = (uint16_t)i;
+        }
+    }
+
+    peak_rel_ts = ctx.samples[peak_idx].rel_ts;
+    peak_val    = max_val;
+
+    t_log("compute_zero_phase_peak", t0);
+}
+
+// =====================================================
+// STATE MACHINE PROCESSING
+// =====================================================
+
+void add_event(TagContext &ctx, uint32_t rel_ts, EventType type, int8_t rssi) {
+    if (ctx.event_count >= MAX_EVENTS_PER_PASS) {
+        Log.warningln(F("Event buffer full, dropping event"));
+        return;
+    }
+    Event &e  = ctx.events[ctx.event_count++];
+    e.rel_ts  = rel_ts;
+    e.pass_id = ctx.pass_id;
+    e.tag_id  = ctx.tag_id;
+    e.type    = type;
+    e.rssi    = rssi;
+}
+
+void start_pass(TagContext &ctx, const Measurement &m) {
+    uint32_t t0 = t_start();
+
+    ctx.in_pass          = true;
+    ctx.pass_id          = g_next_pass_id++;
+    ctx.sample_count     = 0;
+    ctx.event_count      = 0;
+
+    // NEW: record when this pass started
+    ctx.pass_start_rel_ts = m.rel_ts;
+    ctx.pass_start_wall_ms= millis();
+
+    // first sample
+    if (ctx.sample_count < MAX_SAMPLES_PER_PASS) {
+        ctx.samples[ctx.sample_count++] = m;
+    }
+
+    // APPROACHING event
+    int8_t ema_i8 = (int8_t)lrintf(ctx.ema);
+    add_event(ctx, m.rel_ts, EVENT_APPROACHING, ema_i8);
+
+    Log.notice(F("Tag %u: new pass %lu APPROACHING at %lu ms (EMA=%d)\n"),
+               (unsigned)ctx.tag_id,
+               (unsigned long)ctx.pass_id,
+               (unsigned long)m.rel_ts,
+               (int)ema_i8);
+
+    t_log("start_pass", t0);
+}
+
+
+void write_pass_events_to_sd(const TagContext &ctx) {
+    if (!g_sdOk) {
+        Log.errorln(F("write_pass_events_to_sd: SD not OK"));
+        return;
+    }
+
+    uint32_t t_total = t_start();
+    log_heap("before write_pass_events_to_sd");
+
+    // EVENTS: rel_ts,pass_id,tag_id,event_id,rssi
+    for (uint8_t i = 0; i < ctx.event_count; ++i) {
+        const Event &e = ctx.events[i];
+        char line[80];
+        int len = snprintf(line, sizeof(line),
+                           "%lu,%lu,%u,%u,%d",
+                           (unsigned long)e.rel_ts,
+                           (unsigned long)e.pass_id,
+                           (unsigned)e.tag_id,
+                           (unsigned)e.type,
+                           (int)e.rssi);
+        if (len <= 0) continue;
+        if ((size_t)len >= sizeof(line)) {
+            line[sizeof(line) - 1] = '\0';
+        }
+#if VERBOSE_EVENT_LOG
+        Log.notice("%s\n", line);
+#endif
+        log_event_line(String(line));
+    }
+
+    Log.notice(F("Appended EVENTS for pass %lu (%d events)\n"),
+               (unsigned long)ctx.pass_id,
+               (int)ctx.event_count);
+
+    t_log("write_pass_events_to_sd total", t_total);
+    log_heap("after write_pass_events_to_sd");
+}
+
+void finish_pass(TagContext &ctx) {
+    if (!ctx.in_pass) return;
+
+    uint32_t t_total = t_start();
+    Log.notice(F("Tag %u: finishing pass %lu, %u samples\n"),
+               (unsigned)ctx.tag_id,
+               (unsigned long)ctx.pass_id,
+               (unsigned)ctx.sample_count);
+
+    uint32_t peak_rel_ts = ctx.last_rel_ts;
+    float    peak_val    = ctx.ema_init ? ctx.ema : (float)ctx.last_rssi;
+
+    uint32_t t_peak = t_start();
+    compute_zero_phase_peak(ctx, g_cfg.ema_alpha, peak_rel_ts, peak_val);
+    t_log("finish_pass: compute_zero_phase_peak", t_peak);
+
+    // NEW: use this pass to update dynamic window / threshold
+    uint32_t t_dyn = t_start();
+    update_dynamic_window_from_pass(ctx, peak_rel_ts);
+    t_log("finish_pass: update_dynamic_window_from_pass", t_dyn);
+
+    // PEAK event
+    add_event(ctx, peak_rel_ts, EVENT_PEAK, (int8_t)lrintf(peak_val));
+
+    // FINISHED event
+    add_event(ctx, ctx.last_rel_ts, EVENT_FINISHED, ctx.last_rssi);
+
+    write_pass_events_to_sd(ctx);
+
+    ctx.in_pass           = false;
+    ctx.pass_id           = 0;
+    ctx.sample_count      = 0;
+    ctx.event_count       = 0;
+    ctx.ema_init          = false;
+    ctx.pass_start_rel_ts = 0;
+    ctx.pass_start_wall_ms= 0;
+
+    log_heap("after finish_pass");
+    t_log("finish_pass total", t_total);
+}
+
+
+// Handle a single measurement
+void process_sample(const Measurement &m_in) {
+    uint32_t t_total = t_start();
+
+    TagContext *ctx = get_or_create_tag_ctx(m_in.tag_id);
+    if (!ctx) return;
+
+    Measurement m = m_in;  // local copy in case we tweak RSSI
+
+    ctx->last_rel_ts  = m.rel_ts;
+    ctx->last_rssi    = m.rssi;
+    ctx->last_wall_ms = millis();
+
+    // EMA update
+    if (!ctx->ema_init) {
+        ctx->ema      = (float)m.rssi;
+        ctx->ema_init = true;
+    } else {
+        ctx->ema = g_cfg.ema_alpha * (float)m.rssi
+                 + (1.0f - g_cfg.ema_alpha) * ctx->ema;
+    }
+
+    if (!ctx->in_pass) {
+        if (ctx->ema >= g_cfg.approach_threshold) {
+            start_pass(*ctx, m);
+        }
+    } else {
+        // in pass: store sample for peak
+        if (ctx->sample_count < MAX_SAMPLES_PER_PASS) {
+            ctx->samples[ctx->sample_count++] = m;
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                Log.warningln(F("Sample buffer full, dropping further samples this pass"));
+                warned = true;
+            }
+        }
+
+        // end condition: EMA falls below threshold
+        if (ctx->ema < g_cfg.approach_threshold) {
+            Log.notice(F("Tag %u: EMA dropped below threshold (%d < %d), finishing pass %lu\n"),
+                       (unsigned)ctx->tag_id,
+                       (int)ctx->ema,
+                       (int)g_cfg.approach_threshold,
+                       (unsigned long)ctx->pass_id);
+            finish_pass(*ctx);
+        }
+    }
+
+    t_log("process_sample total", t_total);
+}
+
+// Called periodically to end passes that timed out
+void check_pass_timeouts() {
+    uint32_t t_total = t_start();
+    uint32_t now = millis();
+
+    for (int i = 0; i < MAX_TAGS; ++i) {
+        TagContext &ctx = g_tags[i];
+        if (!ctx.used || !ctx.in_pass) continue;
+
+        if (g_dynamic_window_enabled && g_window_half_ms > 0) {
+            // NEW: fixed-duration window centered on TCA:
+            // we start at ~TCA - half, so pass length ~ 2 * half
+            uint32_t elapsed_from_start = now - ctx.pass_start_wall_ms;
+            uint32_t max_window_ms      = 2u * g_window_half_ms;
+
+            if (elapsed_from_start >= max_window_ms) {
+                Log.notice(F("Tag %u: dynamic window timeout (%lu ms), finishing pass %lu\n"),
+                           (unsigned)ctx.tag_id,
+                           (unsigned long)elapsed_from_start,
+                           (unsigned long)ctx.pass_id);
+                uint32_t t_fp = t_start();
+                finish_pass(ctx);
+                t_log("check_pass_timeouts: finish_pass (dynamic)", t_fp);
+            }
+        } else {
+            // ORIGINAL behavior before we have a calibrated window:
+            uint32_t elapsed = now - ctx.last_wall_ms;
+            if (elapsed >= g_cfg.timeout_ms) {
+                Log.notice(F("Tag %u: timeout (%lu ms), finishing pass %lu\n"),
+                           (unsigned)ctx.tag_id,
+                           (unsigned long)elapsed,
+                           (unsigned long)ctx.pass_id);
+                uint32_t t_fp = t_start();
+                finish_pass(ctx);
+                t_log("check_pass_timeouts: finish_pass", t_fp);
+            }
+        }
+    }
+
+    t_log("check_pass_timeouts total", t_total);
+}
+
+
+// =====================================================
+// UART LINE READER (EXT UART → CSV → state machine)
+// =====================================================
+
+void processUART() {
+    uint32_t t_total = t_start();
+    static String lineBuf;
+    static uint32_t total_lines = 0;
+
+    while (ExtSerial.available()) {
+        char c = (char)ExtSerial.read();
+        if (c == '\r') continue;
+
+        if (c == '\n') {
+            if (lineBuf.length() > 0) {
+                total_lines++;
+
+                // 1) log raw CSV EXACTLY as received
+                log_raw_line(lineBuf);
+
+                uint32_t t_line = t_start();
+                Measurement m;
+                bool ok = parseCSV(lineBuf, m);
+                t_log("parseCSV", t_line);
+
+                if (ok) {
+                    // TEMP: flip sign if your transmitter sends positive RSSI
+                    m.rssi = -m.rssi;
+
+                    uint32_t t_proc = t_start();
+                    process_sample(m);
+                    t_log("process_sample from UART line", t_proc);
+                } else {
+                    Log.warning(F("Bad CSV: %s\n"), lineBuf.c_str());
+                }
+            }
+            lineBuf = "";
+        } else {
+            if (lineBuf.length() < 80) {
+                lineBuf += c;
+            } else {
+                Log.warningln(F("Line too long, dropping"));
+                lineBuf = "";
+            }
+        }
+    }
+
+    t_log("processUART total", t_total);
+}
+
+// =====================================================
+// SETUP / LOOP
+// =====================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(300);
+
+    Log.begin(LOG_LEVEL_INFO, &Serial);
+    Log.notice(F("ESP32-CAM: UART→SD_MMC logger (raw.csv + events.csv)\n"));
+    Log.notice("Config: alpha=%.2f, timeout=%lums, approach_threshold=%d dBm, look_distance=%.1fm, pace_5k=%.1fmin\n",
+              g_cfg.ema_alpha,
+              (unsigned long)g_cfg.timeout_ms,
+              (int)g_cfg.approach_threshold,
+              g_cfg.look_distance_m,
+              g_cfg.pace_5k_min);
+
+    log_heap("startup");
+
+    // -----------------------------
+    // Sync RTC from WiFi + NTP
+    // -----------------------------
+    bool rtcSynced = sync_rtc_from_wifi();
+    if (!rtcSynced) {
+        Log.warningln(F("RTC sync failed; continuing without RTC guarantee"));
+    }
+
+    // Init SD_MMC and background loggers
+    bool sdOk = false;
+    const int MAX_INIT_TRIES = 5;
+    int initCount = 0;
+
+    while ((initCount < MAX_INIT_TRIES) && !sdOk) {
+        uint32_t t0 = t_start();
+        sdOk = initSDMMC();
+        t_log("initSDMMC attempt", t0);
+
+        if (sdOk) {
+            Log.noticeln(F("SD_MMC initialized OK\n"));
+        } else {
+            Log.warningln(F("Cannot init SD_MMC, retrying\n"));
+        }
+
+        delay(200);
+        initCount++;
+    }
+
+    if (!sdOk) {
+        Log.errorln(F("Cannot init SD_MMC. Logging disabled.\n"));
+    } else {
+        init_logger(raw_logger);
+        init_logger(event_logger);
+    }
+
+    // External UART (nRF TX on GPIO16)
+    ExtSerial.setRxBufferSize(EXT_RX_BUF);
+    ExtSerial.begin(EXT_BAUD, SERIAL_8N1, UART_RXPIN, UART_TXPIN);
+    Log.notice(F("ExtSerial on RX=%d TX=%d @%lu baud\n"),
+               UART_RXPIN, UART_TXPIN, (unsigned long)EXT_BAUD);
+}
+
+void loop() {
+    uint32_t t0 = t_start();
+
+    processUART();
+    check_pass_timeouts();
+
+    // Periodic buffered flush to SD
+    static uint32_t last_flush_ms = 0;
+    uint32_t now_ms = millis();
+    if ((now_ms - last_flush_ms) >= FLUSH_TIME_INTERVAL_MS) {
+        last_flush_ms = now_ms;
+        logger_flush(raw_logger);
+        logger_flush(event_logger);
+    }
+
+    t_log("loop body", t0);
+    delay(1);  // yield
+}

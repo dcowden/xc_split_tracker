@@ -22,8 +22,8 @@ constexpr int EXT_UART_RXPIN = 16;
 constexpr int EXT_UART_TXPIN = -1;   // not used
 
 // ---------- I2C (DS3231 + OLED) ----------
-constexpr int I2C_SDA_PIN = 4;
-constexpr int I2C_SCL_PIN = 13;
+constexpr int I2C_SDA_PIN = 21;
+constexpr int I2C_SCL_PIN = 22;
 
 constexpr int SD_CS_PIN   = 5;
 constexpr int SD_MISO_PIN = 19;

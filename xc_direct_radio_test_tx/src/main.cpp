@@ -9,7 +9,7 @@
 #include <Arduino.h>
 #include <nrf.h>
 
-#define TAG_ID         1      // change per tag
+#define TAG_ID         2      // change per tag
 #define PACKET_LEN     4
 #define TX_INTERVAL_MS 5
 

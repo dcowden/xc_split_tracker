@@ -80,7 +80,8 @@ extern "C" void RADIO_IRQHandler(void) {
       const uint8_t seq = rx_packet.seq;
 
       // RSSISAMPLE is magnitude of (-RSSI). Convert to signed dBm by negating.
-      const int8_t rssi_dbm = -(int8_t)NRF_RADIO->RSSISAMPLE;
+      const int8_t rssi_dbm = (int8_t)(-(int)NRF_RADIO->RSSISAMPLE);
+
 
       const uint32_t tms = millis();
 

@@ -9,6 +9,7 @@
 #include <SdFat.h>
 #include <RingBuf.h>
 #include <ArduinoLog.h>
+#include <time.h>
 
 #include "config.h"
 #include "types.h"
@@ -197,6 +198,32 @@ static inline bool rssi_sane(int r) { return (r >= SDLOG_RSSI_MIN && r <= SDLOG_
 #endif
 
 // ============================================================
+// Date-stamped filenames (set at mount time; no rotation)
+// ============================================================
+
+static char g_raw_path[32] = "/raw.csv";
+static char g_evt_path[32] = "/events.csv";
+
+static inline void format_paths_from_now() {
+  // Uses current system time (set this via NTP/RTC before SdLogger::mount()).
+  time_t t = time(nullptr);
+  struct tm tmv;
+#if defined(ESP32)
+  localtime_r(&t, &tmv);
+#else
+  tmv = *localtime(&t);
+#endif
+
+  const int y = tmv.tm_year + 1900;
+  const int m = tmv.tm_mon + 1;
+  const int d = tmv.tm_mday;
+
+  // raw_mm_dd_yyyy.csv, events_mm_dd_yyyy.csv
+  snprintf(g_raw_path, sizeof(g_raw_path), "/raw_%02d_%02d_%04d.csv",   m, d, y);
+  snprintf(g_evt_path, sizeof(g_evt_path), "/events_%02d_%02d_%04d.csv", m, d, y);
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -324,8 +351,6 @@ static inline void mount_begin_sequence(uint32_t now) {
 }
 
 static inline bool mount_stepper_once(uint32_t now) {
-  // returns true only if sequence completed successfully and we are LOGGING
-
   // honor grace time
   if ((int32_t)(now - g_mount_grace_until_ms) < 0) {
     return false;
@@ -375,14 +400,17 @@ static inline bool mount_stepper_once(uint32_t now) {
         sd_print_fail_detail("sd.begin");
       }
 
-      // IMPORTANT: only one try per service() call
       return false;
     }
 
     case MountStep::OPEN_FILES: {
-      // raw.csv: fresh
-      if (!g_raw_file.open("/raw.csv", O_RDWR | O_CREAT | O_TRUNC)) {
-        sd_print_fail_detail("open raw.csv");
+      // Set filenames once per mount.
+      // NOTE: this uses time(nullptr), so do NTP/RTC first, then mount().
+      format_paths_from_now();
+
+      // raw: fresh
+      if (!g_raw_file.open(g_raw_path, O_RDWR | O_CREAT | O_TRUNC)) {
+        sd_print_fail_detail("open raw_*");
         g_raw_ok = false;
       } else {
         g_raw_ok = true;
@@ -390,7 +418,7 @@ static inline bool mount_stepper_once(uint32_t now) {
         g_raw_prealloc_ok = false;
         if (RAW_LOG_FILE_SIZE > 0) {
           if (!g_raw_file.preAllocate(RAW_LOG_FILE_SIZE)) {
-            Log.warningln(F("SdLogger: preAllocate(/raw.csv) FAILED (SD UI will show N)"));
+            Log.warningln(F("SdLogger: preAllocate(raw_*) FAILED (SD UI will show N)"));
             g_raw_prealloc_ok = false;
           } else {
             g_raw_prealloc_ok = true;
@@ -403,9 +431,9 @@ static inline bool mount_stepper_once(uint32_t now) {
         g_raw_rb.begin(&g_raw_file);
       }
 
-      // events.csv: append
-      if (!g_evt_file.open("/events.csv", O_RDWR | O_CREAT | O_AT_END)) {
-        sd_print_fail_detail("open events.csv");
+      // events: append
+      if (!g_evt_file.open(g_evt_path, O_RDWR | O_CREAT | O_AT_END)) {
+        sd_print_fail_detail("open events_*");
         g_evt_ok = false;
       } else {
         g_evt_ok = true;
@@ -423,16 +451,16 @@ static inline bool mount_stepper_once(uint32_t now) {
 
     case MountStep::DONE_OK: {
 #if SDLOG_DEBUG
-      Serial.printf("[SDLOG] mount done. sd_ok=%u raw_ok=%u evt_ok=%u prealloc=%u rb=%uB evtQ=%u/%u\n",
+      Serial.printf("[SDLOG] mount done. sd_ok=%u raw_ok=%u evt_ok=%u prealloc=%u rb=%uB evtQ=%u/%u files=(%s,%s)\n",
                     (unsigned)g_sd_ok, (unsigned)g_raw_ok, (unsigned)g_evt_ok, (unsigned)g_raw_prealloc_ok,
-                    (unsigned)(512 * RAW_RB_SECTORS), (unsigned)g_evt_q_count, (unsigned)EVT_Q_LEN);
+                    (unsigned)(512 * RAW_RB_SECTORS), (unsigned)g_evt_q_count, (unsigned)EVT_Q_LEN,
+                    g_raw_path, g_evt_path);
 #endif
       set_state(SdState::LOGGING);
       return true;
     }
 
     case MountStep::DONE_FAIL: {
-      // stop touching SD immediately; schedule retry later
       sd_end_everything();
       set_state(SdState::FAULTED);
       g_next_retry_ms = now + SD_REMOUNT_PERIOD_MS;
@@ -452,7 +480,6 @@ inline bool is_mounted() {
 }
 
 inline bool mount() {
-  // request mount; actual work happens in service()
   if (g_state == SdState::LOGGING) return is_mounted();
   set_state(SdState::WANT_MOUNT);
   return false;
@@ -461,7 +488,6 @@ inline bool mount() {
 inline void unmount() {
   sd_end_everything();
   set_state(SdState::UNMOUNTED);
-  // after manual unmount, don't auto-retry unless mount() called again
   g_next_retry_ms = 0;
   mount_step_reset();
 }
@@ -475,6 +501,8 @@ inline void log_raw_sample(uint64_t unix_ms,
                            uint16_t tag_id,
                            uint32_t pass_id,
                            int8_t rssi) {
+  (void)unix_ms; // filename set at mount time; unix_ms still logged in the CSV
+
   if (g_state != SdState::LOGGING || !g_sd_ok || !g_raw_ok) return;
 
 #if SDLOG_DEBUG
@@ -483,34 +511,48 @@ inline void log_raw_sample(uint64_t unix_ms,
   g_last_tag_id  = tag_id;
   g_last_pass_id = pass_id;
   g_last_rssi    = (int16_t)rssi;
-
-  const int r = (int)rssi;
-  if (!rssi_sane(r)) {
-    Serial.printf("[SDLOG] WARN: insane rssi=%d tag=%u rel=%lu\n",
-                  r, (unsigned)tag_id, (unsigned long)rel_ms);
-  }
 #endif
 
-  g_raw_rb.print((unsigned long long)unix_ms); g_raw_rb.write(',');
-  g_raw_rb.print(rel_ms);                      g_raw_rb.write(',');
-  g_raw_rb.print(tag_id);                      g_raw_rb.write(',');
-  g_raw_rb.print(pass_id);                     g_raw_rb.write(',');
-  g_raw_rb.println((int)rssi);
+  char line[64];
+  const int n = snprintf(line, sizeof(line),
+                         "%llu,%lu,%u,%lu,%d\n",
+                         (unsigned long long)unix_ms,
+                         (unsigned long)rel_ms,
+                         (unsigned)tag_id,
+                         (unsigned long)pass_id,
+                         (int)rssi);
 
-  if (g_raw_rb.getWriteError()) {
+  if (n <= 0 || n >= (int)sizeof(line)) {
     g_drop_raw_full++;
-    g_raw_rb.clearWriteError();
+    return;
+  }
+
+  constexpr uint32_t RAW_CAP = 512U * RAW_RB_SECTORS;
+  const uint32_t used = g_raw_rb.bytesUsed();
+  const uint32_t free = (used <= RAW_CAP) ? (RAW_CAP - used) : 0;
+
+  if (free < (uint32_t)n) {
+    g_drop_raw_full++;
+    return;
+  }
+
+  noInterrupts();
+  const size_t wn = g_raw_rb.write((const uint8_t*)line, (size_t)n);
+  interrupts();
+
+  if (wn != (size_t)n) {
+    g_drop_raw_full++;
+    if (g_raw_rb.getWriteError()) g_raw_rb.clearWriteError();
   }
 }
 
 inline void log_event(uint64_t unix_ms, const Event &e) {
-  // buffer regardless of SD state
   if (!evt_q_push(unix_ms, e)) {
     const uint32_t start = millis();
     g_evt_enqueue_spins++;
 
     while (evt_q_full() && (millis() - start) < EVT_ENQUEUE_SPIN_MS) {
-      service();  // try to drain if SD is up
+      service();
       delay(0);
     }
 
@@ -538,10 +580,8 @@ inline void log_event(uint64_t unix_ms, const Event &e) {
 inline void service() {
   const uint32_t now = millis();
 
-  // ---------- State machine: MOUNT sequencing (one step per call) ----------
   if (g_state == SdState::WANT_MOUNT) {
     mount_begin_sequence(now);
-    // no return; let it immediately proceed if grace already elapsed (usually not)
   }
 
   if (g_state == SdState::FAULTED) {
@@ -551,11 +591,9 @@ inline void service() {
   }
 
   if (g_state == SdState::MOUNTING) {
-    // IMPORTANT: this does ONE small step per call (at most one sd.begin attempt)
     mount_stepper_once(now);
   }
 
-  // ---------- If not logging, we can still print heartbeat and return ----------
   if (g_state != SdState::LOGGING || !g_sd_ok) {
 #if SDLOG_DEBUG
     if (SDLOG_HEARTBEAT_MS > 0 && (now - g_last_heartbeat_ms) >= SDLOG_HEARTBEAT_MS) {
@@ -573,7 +611,7 @@ inline void service() {
     return;
   }
 
-  // ---------- Drain raw RingBuf (bounded) ----------
+  // Drain raw RingBuf (bounded)
   if (g_raw_ok) {
     uint8_t blocks = SD_SERVICE_MAX_RAW_BLOCKS;
     while (blocks-- && g_raw_rb.bytesUsed() >= 512) {
@@ -586,7 +624,6 @@ inline void service() {
       const int n = g_raw_rb.writeOut(512);
       if (n != 512) {
         Log.errorln(F("SdLogger: writeOut(512) failed => FAULT"));
-        // Fault -> stop SD and retry later
         sd_end_everything();
         set_state(SdState::FAULTED);
         g_next_retry_ms = now + SD_REMOUNT_PERIOD_MS;
@@ -595,7 +632,7 @@ inline void service() {
     }
   }
 
-  // ---------- Drain event queue (bounded) ----------
+  // Drain event queue (bounded)
   if (g_evt_ok) {
     uint8_t budget = SD_SERVICE_EVENT_BUDGET;
     while (budget-- && !evt_q_empty()) {
@@ -625,14 +662,15 @@ inline void service() {
 #if SDLOG_DEBUG
   if (SDLOG_HEARTBEAT_MS > 0 && (now - g_last_heartbeat_ms) >= SDLOG_HEARTBEAT_MS) {
     g_last_heartbeat_ms = now;
-    Serial.printf("[SDLOG] hb state=%u raw=%lu evtQ=%u/%u evtIn=%lu evtOut=%lu drops(rawFull=%lu evtDrop=%lu)\n",
+    Serial.printf("[SDLOG] hb state=%u raw=%lu evtQ=%u/%u evtIn=%lu evtOut=%lu drops(rawFull=%lu evtDrop=%lu) files=(%s,%s)\n",
                   (unsigned)g_state,
                   (unsigned long)g_total_raw,
                   (unsigned)g_evt_q_count, (unsigned)EVT_Q_LEN,
                   (unsigned long)g_total_evt_in,
                   (unsigned long)g_total_evt_out,
                   (unsigned long)g_drop_raw_full,
-                  (unsigned long)g_drop_evt_q_full);
+                  (unsigned long)g_drop_evt_q_full,
+                  g_raw_path, g_evt_path);
   }
 #endif
 }

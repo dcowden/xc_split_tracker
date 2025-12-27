@@ -1,4 +1,6 @@
-// TimeSync.h
+// timesync.h  (non-blocking, connect-first; NO scanning)
+// Header-only, call TimeSync::begin(...) once, then TimeSync::service() frequently.
+// Use TimeSync::indicator_char() for UI: '?' running, 'Y' success, 'X' fail.
 #pragma once
 
 #include <Arduino.h>
@@ -6,122 +8,182 @@
 #include <time.h>
 #include <sys/time.h>
 #include <ArduinoLog.h>
+
 namespace TimeSync {
 
-  // ============================================================
-  // Public API
-  // ============================================================
-  // Returns Unix epoch time in milliseconds, or -1 on failure.
-  // Assumes WiFi is OFF initially and turns it OFF before returning.
-  inline int64_t fetchTimeMs(const char* ssid,
-                             const char* password,
-                             uint32_t timeoutMs,
-                             const char* ntp1 = "pool.ntp.org",
-                             const char* ntp2 = "time.nist.gov",
-                             const char* ntp3 = "time.google.com") {
-
-    Log.noticeln(F("Syncing Time..."));
-    if (!ssid || !*ssid || !password){
-        Log.warningln(F("Can't sync: ssid, password not populated"));                            
-        return -1;
-    } 
-
-    const uint32_t startMs    = millis();
-    const uint32_t deadlineMs = startMs + timeoutMs;
-
-    // ------------------------------------------------------------
-    // Helpers (inline so this remains header-only)
-    // ------------------------------------------------------------
-    auto wifiCleanup = []() {
-      WiFi.disconnect(true /*wifioff*/, true /*eraseAP*/);
-      WiFi.mode(WIFI_OFF);
-      delay(20);
-      Log.noticeln(F("Wifi Disconnected."));  
+    enum class State : uint8_t {
+        IDLE = 0,
+        CONNECTING,
+        START_NTP,
+        WAIT_TIME,
+        CLEANUP,
+        DONE_OK,
+        DONE_FAIL
     };
 
-    auto ssidIsVisible = [&](const char* target) -> bool {
-      int n = WiFi.scanNetworks(false /*sync*/, true /*show hidden*/);
-      if (n <= 0) return false;
-      for (int i = 0; i < n; i++) {
-        if (millis() > deadlineMs) break;
-        if (WiFi.SSID(i).equals(target)) return true;
-      }
-      return false;
-    };
+    // Config
+    static const char* s_ssid = nullptr;
+    static const char* s_pw   = nullptr;
+    static uint32_t    s_timeout_ms = 0;
 
-    auto connectWifi = [&](const char* s, const char* p) -> bool {
-      WiFi.persistent(false);     // don't touch flash
-      WiFi.setAutoReconnect(false);
-      WiFi.mode(WIFI_STA);
-      WiFi.disconnect(true, true);
-      delay(50);
+    static const char* s_ntp1 = "pool.ntp.org";
+    static const char* s_ntp2 = "time.nist.gov";
+    static const char* s_ntp3 = "time.google.com";
 
-      WiFi.begin(s, p);
-      while (WiFi.status() != WL_CONNECTED) {
-        if (millis() > deadlineMs) return false;
-        delay(25);
-      }
-      return true;
-    };
+    static State       s_state = State::IDLE;
+    static uint32_t    s_start_ms = 0;
+    static uint32_t    s_deadline_ms = 0;
 
-    auto waitForTimeSync = [&]() -> bool {
-      // Anything after 2020-01-01 counts as "real"
-      constexpr time_t MIN_VALID_TIME = 1577836800;
-      while (true) {
-        if (time(nullptr) >= MIN_VALID_TIME) return true;
-        if (millis() > deadlineMs) return false;
-        delay(25);
-      }
-    };
+    static bool        s_success_latched = false;
+    static bool        s_success_consumed = true;
+    static int64_t     s_result_ms = -1;
 
-    auto unixMsNow = []() -> int64_t {
-      struct timeval tv;
-      gettimeofday(&tv, nullptr);
-      return (int64_t)tv.tv_sec * 1000LL + (tv.tv_usec / 1000);
-    };
+    // "time is real" threshold
+    static constexpr time_t MIN_VALID_TIME = 1577836800; // 2020-01-01
 
-    // ------------------------------------------------------------
-    // (a) Bring WiFi up and scan
-    // ------------------------------------------------------------
-    Log.noticeln(F("Looking for Wifi.."));
-    WiFi.mode(WIFI_STA);
-    delay(10);
+    inline void wifi_cleanup() {
+        // Leave no WiFi running (you want battery + determinism)
+        WiFi.disconnect(true /*wifioff*/, true /*eraseAP*/);
+        WiFi.mode(WIFI_OFF);
+        Log.noticeln(F("TimeSync: disconnected wifi"));
+        delay(10);
+    }
 
-    if (!ssidIsVisible(ssid)) {
-      wifiCleanup();
-      Log.warningln(F("Cant find wifi network"));
-      return -1;
+    inline int64_t unix_ms_now() {
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        return (int64_t)tv.tv_sec * 1000LL + (tv.tv_usec / 1000);
+    }
+
+    inline void reset_runtime() {
+        s_result_ms = -1;
+        s_success_latched = false;
+        s_success_consumed = true;
+    }
+
+    inline bool timed_out() {
+        return (int32_t)(millis() - s_deadline_ms) > 0;
     }
 
     // ------------------------------------------------------------
-    // (b) Connect
+    // Public API
     // ------------------------------------------------------------
-    if (!connectWifi(ssid, password)) {
-      Log.warningln(F("Cant connect to wifi."));  
-      wifiCleanup();
-      return -1;
+    inline void begin(const char* ssid,
+                      const char* password,
+                      uint32_t timeoutMs,
+                      const char* ntp1 = "pool.ntp.org",
+                      const char* ntp2 = "time.nist.gov",
+                      const char* ntp3 = "time.google.com")
+    {
+        // If already running, ignore (keeps behavior deterministic)
+        if (s_state != State::IDLE && s_state != State::DONE_OK && s_state != State::DONE_FAIL) return;
+
+        s_ssid = ssid;
+        s_pw   = password;
+        s_timeout_ms = timeoutMs;
+
+        s_ntp1 = ntp1;
+        s_ntp2 = ntp2;
+        s_ntp3 = ntp3;
+
+        reset_runtime();
+
+        if (!s_ssid || !*s_ssid || !s_pw) {
+            Log.warningln(F("TimeSync: ssid/password missing"));
+            s_state = State::DONE_FAIL;
+            return;
+        }
+
+        s_start_ms = millis();
+        s_deadline_ms = s_start_ms + s_timeout_ms;
+
+        // Known-good WiFi setup for "connect now, then shut off"
+        WiFi.persistent(false);       // don't write flash
+        WiFi.setAutoReconnect(false);
+        WiFi.mode(WIFI_STA);
+
+        // This can help on some networks where ESP32 sleep breaks initial connect
+        WiFi.setSleep(false);
+
+        // Start from clean slate
+        WiFi.disconnect(true, true);
+        delay(20);
+
+        Log.noticeln(F("TimeSync: connecting (no scan)..."));
+        WiFi.begin(s_ssid, s_pw);
+
+        s_state = State::CONNECTING;
     }
-    Log.noticeln(F("Connected. Syncing NTP"));
-    // ------------------------------------------------------------
-    // (c) NTP sync (UTC)
-    // ------------------------------------------------------------
-    //configTime(0, 0, ntp1, ntp2, ntp3);
-    configTzTime("EST5EDT,M3.2.0/2,M11.1.0/2", ntp1, ntp2, ntp3);
 
+    inline void service() {
+        if (s_state == State::IDLE || s_state == State::DONE_OK || s_state == State::DONE_FAIL) return;
 
-    if (!waitForTimeSync()) {
-      Log.warningln(F("NTP Sync timed out."));  
-      wifiCleanup();
-      return -1;
+        if (timed_out()) {
+            Log.warningln(F("TimeSync: timeout"));
+            s_state = State::CLEANUP;
+        }
+
+        switch (s_state) {
+
+            case State::CONNECTING: {
+                const wl_status_t st = WiFi.status();
+                if (st == WL_CONNECTED) {
+                    Log.noticeln(F("TimeSync: connected, starting NTP"));
+                    s_state = State::START_NTP;
+                } else if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
+                    // Fast-fail states (still respect the timeout, but don't spin forever)
+                    Log.warningln(F("TimeSync: connect failed / no ssid"));
+                    s_state = State::CLEANUP;
+                }
+                return;
+            }
+
+            case State::START_NTP: {
+                // Use TZ-aware NTP call (same as your old code)
+                configTzTime("EST5EDT,M3.2.0/2,M11.1.0/2", s_ntp1, s_ntp2, s_ntp3);
+                s_state = State::WAIT_TIME;
+                return;
+            }
+
+            case State::WAIT_TIME: {
+                // Wait for system time to become "real"
+                if (time(nullptr) >= MIN_VALID_TIME) {
+                    s_result_ms = unix_ms_now();
+                    s_success_latched = true;
+                    s_success_consumed = false;
+                    Log.noticeln(F("TimeSync: NTP OK"));
+                    s_state = State::CLEANUP;
+                }
+                return;
+            }
+
+            case State::CLEANUP: {
+                wifi_cleanup();
+                s_state = s_success_latched ? State::DONE_OK : State::DONE_FAIL;
+                return;
+            }
+
+            default:
+                return;
+        }
     }
 
-    int64_t resultMs = unixMsNow();
-    Log.warningln(F("Received Network time OK"));
-    // ------------------------------------------------------------
-    // Always shut WiFi back down
-    // ------------------------------------------------------------
-    wifiCleanup();
-    return resultMs;
-  }
+    inline char indicator_char() {
+        switch (s_state) {
+            case State::DONE_OK:   return 'Y';
+            case State::DONE_FAIL: return 'X';
+            case State::IDLE:      return 'X'; // not attempted = looks like fail (change if you want)
+            default:               return '?'; // running
+        }
+    }
+
+    // Returns true exactly once when a successful time is ready
+    inline bool consume_success_time_ms(int64_t &out_ms) {
+        if (!s_success_latched) return false;
+        if (s_success_consumed) return false;
+        out_ms = s_result_ms;
+        s_success_consumed = true;
+        return true;
+    }
 
 } // namespace TimeSync

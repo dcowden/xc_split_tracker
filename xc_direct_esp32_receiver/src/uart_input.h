@@ -8,8 +8,8 @@
 
 #include "config.h"
 
-// NEW: include seq
-using SampleFn = void (*)(uint32_t rel_ms, uint16_t tag_id, uint8_t seq, int8_t rssi);
+// callback now includes computed unix_ms
+using SampleFn = void (*)(uint32_t rel_ms, int64_t unix_ms, uint16_t tag_id, uint8_t seq, int8_t rssi);
 
 class UartInput {
 public:
@@ -31,6 +31,20 @@ public:
 
     void set_callback(SampleFn fn) { m_cb = fn; }
 
+    // Provide RTC/NTP-backed Unix-ms clock
+    using UnixNowFn = int64_t (*)();
+    void set_unix_now_fn(UnixNowFn fn) { m_unix_now = fn; }
+
+    bool timebase_valid() const { return m_time_base_valid; }
+
+    // Convert a receiver rel_ms into unix_ms using the captured base.
+    // If base isn't set yet, returns 0 (caller can decide what to do).
+    int64_t unix_from_rel(uint32_t rel_ms) const {
+        if (!m_time_base_valid) return 0;
+        return m_base_unix_ms + (int64_t)((int32_t)(rel_ms - m_base_rel_ms));
+    }
+
+
     void service() {
         while (m_ser.available()) {
             char c = (char)m_ser.read();
@@ -43,7 +57,6 @@ public:
                 }
             } else {
                 if (m_line.isFull()) {
-                    // drop overlong line
                     note_overflow();
                     clear_line();
                 } else {
@@ -55,9 +68,15 @@ public:
 
 private:
     HardwareSerial& m_ser;
-    SampleFn m_cb = nullptr;
+    SampleFn  m_cb = nullptr;
+    UnixNowFn m_unix_now = nullptr;
 
     CircularBuffer<char, MAX_LINE_LEN> m_line;
+
+    // one-time timebase
+    bool     m_time_base_valid = false;
+    uint32_t m_base_rel_ms = 0;
+    int64_t  m_base_unix_ms = 0;
 
     inline void clear_line() {
         while (!m_line.isEmpty()) m_line.shift();
@@ -134,7 +153,6 @@ private:
 #endif
     }
 
-    // Parse integer and require the next char to be a delimiter (',' or '\0')
     static inline bool parse_long_field(const char*& p, long& out, char delim_expected) {
         char* end = nullptr;
         out = strtol(p, &end, 10);
@@ -143,7 +161,7 @@ private:
             if (*end != ',') return false;
             p = end + 1;
             return true;
-        } else { // '\0'
+        } else {
             if (*end != '\0') return false;
             p = end;
             return true;
@@ -151,7 +169,6 @@ private:
     }
 
     void parse_and_emit() {
-        // Pull line into tmp buffer
         char tmp[MAX_LINE_LEN];
         size_t n = 0;
         while (!m_line.isEmpty() && n < (MAX_LINE_LEN - 1)) {
@@ -165,66 +182,56 @@ private:
         const char* p = tmp;
         long rel_l = 0, tag_l = 0, seq_l = 0, rssi_l = 0;
 
-        // rel_ms,
-        if (!parse_long_field(p, rel_l, ',')) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad line (rel): ", tmp);
-            return;
-        }
-        // tag,
-        if (!parse_long_field(p, tag_l, ',')) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad line (tag): ", tmp);
-            return;
-        }
-        // seq,
-        if (!parse_long_field(p, seq_l, ',')) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad line (seq): ", tmp);
-            return;
-        }
-        // rssi\0
-        if (!parse_long_field(p, rssi_l, '\0')) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad line (rssi): ", tmp);
-            return;
-        }
+        if (!parse_long_field(p, rel_l, ',')) { m_bad_lines++; rate_limited_print_line("[UART] bad line (rel): ", tmp); return; }
+        if (!parse_long_field(p, tag_l, ',')) { m_bad_lines++; rate_limited_print_line("[UART] bad line (tag): ", tmp); return; }
+        if (!parse_long_field(p, seq_l, ',')) { m_bad_lines++; rate_limited_print_line("[UART] bad line (seq): ", tmp); return; }
+        if (!parse_long_field(p, rssi_l, '\0')) { m_bad_lines++; rate_limited_print_line("[UART] bad line (rssi): ", tmp); return; }
 
-        // Range / sanity checks
-        if (rel_l < 0 || rel_l > 0xFFFFFFFFL) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad rel range: ", tmp);
-            return;
-        }
-        if (tag_l < 0 || tag_l > 0xFFFFL) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad tag range: ", tmp);
-            return;
-        }
-        if (seq_l < 0 || seq_l > 255) {
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad seq range: ", tmp);
-            return;
-        }
-        if (rssi_l < -127 || rssi_l > 0) { // RSSI should be negative; 0 is "possible" but suspicious
-            m_bad_lines++;
-            rate_limited_print_line("[UART] bad rssi range: ", tmp);
-            return;
-        }
+        if (rel_l < 0 || rel_l > 0xFFFFFFFFL) { m_bad_lines++; rate_limited_print_line("[UART] bad rel range: ", tmp); return; }
+        if (tag_l < 0 || tag_l > 0xFFFFL)     { m_bad_lines++; rate_limited_print_line("[UART] bad tag range: ", tmp); return; }
+        if (seq_l < 0 || seq_l > 255)         { m_bad_lines++; rate_limited_print_line("[UART] bad seq range: ", tmp); return; }
+        if (rssi_l < -127 || rssi_l > 0)      { m_bad_lines++; rate_limited_print_line("[UART] bad rssi range: ", tmp); return; }
 
         const int rssi_i = (int)rssi_l;
         if (!rssi_sane(rssi_i)) {
-            // Don’t reject by default — just print so you can see if the wire data is weird.
-            // If you want to hard-drop these, uncomment the return.
             m_bad_lines++;
             rate_limited_print_line("[UART] rssi out of sane range: ", tmp);
-            // return;
         }
 
         m_good_lines++;
 
+        const uint32_t rel_ms = (uint32_t)rel_l;
+        const int64_t unix_now = (m_unix_now) ? m_unix_now() : 0;
+
+        // Set base once (single offset)
+        if (!m_time_base_valid && unix_now != 0) {
+            m_time_base_valid = true;
+            m_base_rel_ms = rel_ms;
+            m_base_unix_ms = unix_now;
+#if UARTINPUT_DEBUG
+            Serial.printf("[UART] time base set: base_rel=%lu base_unix=%lld\n",
+                          (unsigned long)m_base_rel_ms, (long long)m_base_unix_ms);
+#endif
+        }
+
+        int64_t unix_ms = unix_now; // fallback
+        if (m_time_base_valid) {
+            unix_ms = m_base_unix_ms + (int64_t)((int32_t)(rel_ms - m_base_rel_ms));
+        }
+
+        // Optional: handle receiver reboot (rel_ms jump backwards)
+        if (m_time_base_valid && rel_ms + 5000UL < m_base_rel_ms) {
+#if UARTINPUT_DEBUG
+            Serial.printf("[UART] rel_ms jumped backwards (reboot?) rel=%lu old_base_rel=%lu -> rebase\n",
+                          (unsigned long)rel_ms, (unsigned long)m_base_rel_ms);
+#endif
+            m_base_rel_ms  = rel_ms;
+            m_base_unix_ms = unix_now;
+            unix_ms = m_base_unix_ms;
+        }
+
         if (m_cb) {
-            m_cb((uint32_t)rel_l, (uint16_t)tag_l, (uint8_t)seq_l, (int8_t)rssi_l);
+            m_cb(rel_ms, unix_ms, (uint16_t)tag_l, (uint8_t)seq_l, (int8_t)rssi_l);
         }
     }
 };

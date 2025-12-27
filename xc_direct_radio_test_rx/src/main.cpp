@@ -1,4 +1,5 @@
 // main.cpp — nRF52840 RX: ring-buffered radio capture -> UART, 1Hz USB stats (counts + min/max/EMA)
+// Adds: battery health in per-tag summary (decoded from packet.battery[15:8])
 // Adds: once/second USB line showing the last UART packet exactly as sent: "last sent: <data>"
 //
 // Notes:
@@ -26,7 +27,7 @@ static constexpr uint16_t RB_MASK = RB_SIZE - 1;
 typedef struct __attribute__((packed)) {
   uint8_t  tag_id;
   uint8_t  seq;
-  uint16_t reserved;
+  uint16_t battery;   // [15:8] = health (5..10), [7:0] reserved
 } xc_packet_t;
 
 // RADIO DMA buffer
@@ -40,6 +41,7 @@ struct RxEntry {
   uint8_t  tag_id;
   uint8_t  seq;
   int8_t   rssi_dbm;
+  uint8_t  batt_health;   // NEW: decoded 0..255 (we expect 5..10)
 };
 
 static RxEntry           g_rb[RB_SIZE];
@@ -55,6 +57,11 @@ static volatile int8_t   g_tag_min   [MAX_TAG_ID];
 static volatile int8_t   g_tag_max   [MAX_TAG_ID];
 static volatile float    g_tag_ema   [MAX_TAG_ID];
 static volatile bool     g_tag_seen  [MAX_TAG_ID];
+
+// NEW: per-tag battery health tracking
+static volatile uint8_t  g_tag_batt_last[MAX_TAG_ID];
+static volatile bool     g_tag_batt_seen[MAX_TAG_ID];
+
 static volatile uint32_t g_total_ok  = 0;
 
 // =====================
@@ -79,9 +86,11 @@ extern "C" void RADIO_IRQHandler(void) {
       const uint8_t tag = rx_packet.tag_id;
       const uint8_t seq = rx_packet.seq;
 
-      // RSSISAMPLE is magnitude of (-RSSI). Convert to signed dBm by negating.
-      const int8_t rssi_dbm = (int8_t)(-(int)NRF_RADIO->RSSISAMPLE);
+      // NEW: battery health (high byte)
+      const uint8_t batt_health = (uint8_t)((rx_packet.battery >> 8) & 0xFF);
 
+      // RSSISAMPLE is magnitude of (-RSSI). Convert to signed dBm by negating.
+      const int8_t rssi_dbm = -(int8_t)NRF_RADIO->RSSISAMPLE;
 
       const uint32_t tms = millis();
 
@@ -100,6 +109,10 @@ extern "C" void RADIO_IRQHandler(void) {
         g_tag_ema[tag] = EMA_ALPHA * (float)rssi_dbm + (1.0f - EMA_ALPHA) * g_tag_ema[tag];
       }
 
+      // NEW: battery last-seen per tag
+      g_tag_batt_last[tag] = batt_health;
+      g_tag_batt_seen[tag] = true;
+
       // Push into ring buffer
       const uint16_t w    = g_rb_w;
       const uint16_t next = (uint16_t)((w + 1) & RB_MASK);
@@ -107,10 +120,11 @@ extern "C" void RADIO_IRQHandler(void) {
       if (next == g_rb_r) {
         g_rb_drops++;
       } else {
-        g_rb[w].t_ms     = tms;
-        g_rb[w].tag_id   = tag;
-        g_rb[w].seq      = seq;
-        g_rb[w].rssi_dbm = rssi_dbm;
+        g_rb[w].t_ms        = tms;
+        g_rb[w].tag_id      = tag;
+        g_rb[w].seq         = seq;
+        g_rb[w].rssi_dbm    = rssi_dbm;
+        g_rb[w].batt_health = batt_health; // NEW
         g_rb_w = next;
       }
     }
@@ -196,6 +210,9 @@ void setup() {
     g_tag_max[i]    = -128;
     g_tag_ema[i]    = 0.0f;
     g_tag_seen[i]   = false;
+
+    g_tag_batt_last[i] = 0;
+    g_tag_batt_seen[i] = false;
   }
 
   g_last_uart_line[0] = '\0';
@@ -236,7 +253,7 @@ void loop() {
     }
   }
 
-  // Once per second: print per-tag counts + min/max/ema and last UART line to USB
+  // Once per second: print per-tag counts + min/max/ema + batt and last UART line to USB
   static uint32_t last_print_ms = 0;
   const uint32_t now = millis();
   if ((now - last_print_ms) >= 1000) {
@@ -248,6 +265,9 @@ void loop() {
     int8_t   maxv  [MAX_TAG_ID];
     float    ema   [MAX_TAG_ID];
     bool     seen  [MAX_TAG_ID];
+
+    uint8_t  batt_last[MAX_TAG_ID];
+    bool     batt_seen[MAX_TAG_ID];
 
     char last_line_copy[48];
     uint16_t last_len_copy;
@@ -261,12 +281,14 @@ void loop() {
       maxv[i]   = g_tag_max[i];
       ema[i]    = g_tag_ema[i];
       seen[i]   = g_tag_seen[i];
+
+      batt_last[i] = g_tag_batt_last[i];
+      batt_seen[i] = g_tag_batt_seen[i];
     }
     last_len_copy = g_last_uart_len;
     memcpy(last_line_copy, g_last_uart_line, sizeof(last_line_copy));
     interrupts();
 
-    // Ensure NUL even if something weird happens
     last_line_copy[sizeof(last_line_copy) - 1] = '\0';
 
     Serial.println();
@@ -281,13 +303,12 @@ void loop() {
     if (last_len_copy == 0) {
       Serial.println("(none yet)");
     } else {
-      // last_line_copy already includes '\n' because that's how we sent it
       Serial.print(last_line_copy);
       if (last_line_copy[last_len_copy - 1] != '\n') Serial.println();
     }
 
-    Serial.println("Tag  Events  Min  Max  EMA");
-    Serial.println("--------------------------");
+    Serial.println("Tag  Events  Min  Max  EMA   Batt");
+    Serial.println("----------------------------------");
 
     for (uint16_t i = 0; i < MAX_TAG_ID; i++) {
       if (seen[i] && counts[i]) {
@@ -299,7 +320,14 @@ void loop() {
         Serial.print("  ");
         Serial.print((int)maxv[i]);
         Serial.print("  ");
-        Serial.println(ema[i], 1);
+        Serial.print(ema[i], 1);
+        Serial.print("   ");
+
+        if (batt_seen[i]) {
+          Serial.println((unsigned)batt_last[i]); // expected 5..10
+        } else {
+          Serial.println("-");
+        }
       }
     }
   }

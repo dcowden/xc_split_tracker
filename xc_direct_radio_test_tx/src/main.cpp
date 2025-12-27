@@ -8,10 +8,18 @@
 //  - Sample VBAT on a Ticker at BATTERY_SAMPLE_INTERVAL_MS
 //  - Map to uint8 health: 10 at 4.2V, 5 at "replace"
 //  - Send health in every transmitted packet (battery[15:8])
+//
+// Motion sleep (SW-18020P / spring vibration switch):
+//  - Wire switch between D2 and GND
+//  - Add ~1 MΩ pull-up from D2 to 3V3
+//  - Any vibration updates "last motion"
+//  - After 15 minutes with no vibration, enter SYSTEMOFF
+//  - Wake on D2 sensing LOW (switch closure to GND) -> reboot and resume TX
 
 #include <Arduino.h>
 #include <nrf.h>
 #include <Ticker.h>
+#include <nrf_gpio.h>
 
 // ---------------------------
 // Mode switch
@@ -29,6 +37,15 @@
 // ---------------------------
 static constexpr uint8_t VBAT_EN  = 14;  // P0.14 / D14 (active LOW)
 static constexpr uint8_t VBAT_ADC = 32;  // P0.31 (ADC input)
+
+// ---------------------------
+// Motion sleep pins/config
+// ---------------------------
+static constexpr uint8_t  MOTION_PIN     = D2;                 // XIAO D2
+static constexpr uint32_t MOTION_IDLE_MS = 15UL * 60UL * 1000UL; // 15 minutes
+
+static volatile bool     g_motion_flag    = false;
+static volatile uint32_t g_last_motion_ms = 0;
 
 // ---------------------------
 // Config
@@ -114,13 +131,35 @@ static Ticker g_battery_ticker(on_battery_sample_tick,
                                0,
                                MILLIS);
 
+// ---------------------------
+// Motion handling
+// ---------------------------
+static void on_motion_isr()
+{
+  g_motion_flag = true;
+}
+
+static void motion_init()
+{
+  // External ~1M pull-up to 3V3, switch to GND
+  pinMode(MOTION_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(MOTION_PIN), on_motion_isr, FALLING);
+
+  g_last_motion_ms = millis();
+}
+
+// ---------------------------
+// Debug (optional)
+// ---------------------------
 #if PROGRAMMING_MODE
 static void on_debug_tick()
 {
   Serial.print("seq=");
   Serial.print(tx_packet.seq);
   Serial.print(" batt_health=");
-  Serial.println((uint32_t)g_batt_health);
+  Serial.print((uint32_t)g_batt_health);
+  Serial.print(" idle_ms=");
+  Serial.println((uint32_t)(millis() - g_last_motion_ms));
 }
 static Ticker g_debug_ticker(on_debug_tick, DEBUG_INTERVAL_MS, 0, MILLIS);
 
@@ -235,6 +274,48 @@ static void radio_init_tx()
 }
 
 // ---------------------------
+// Deep sleep (SYSTEMOFF)
+// ---------------------------
+static void go_to_system_off()
+{
+#if PROGRAMMING_MODE
+  Serial.println("Entering SYSTEMOFF (no motion)...");
+  Serial.flush();
+#endif
+
+  // Stop periodic TX schedule
+  NRF_TIMER0->TASKS_STOP = 1;
+  NVIC_DisableIRQ(TIMER0_IRQn);
+
+  // Stop radio
+  NRF_RADIO->TASKS_DISABLE = 1;
+  NVIC_DisableIRQ(RADIO_IRQn);
+
+  // Stop tickers
+  g_battery_ticker.stop();
+#if PROGRAMMING_MODE
+  g_debug_ticker.stop();
+#endif
+
+  // Configure MOTION_PIN as a wake source: sense LOW (switch closes to GND)
+  // Arduino pin -> nRF pin number using core mapping table
+  uint32_t nrf_pin = g_ADigitalPinMap[MOTION_PIN];
+
+  nrf_gpio_cfg_sense_input(
+      nrf_pin,
+      NRF_GPIO_PIN_NOPULL,     // external pull-up handles it
+      NRF_GPIO_PIN_SENSE_LOW   // wake when pin goes LOW
+  );
+
+  // Enter SYSTEMOFF (wake triggers reset-like boot)
+  NRF_POWER->SYSTEMOFF = 1;
+
+  __DSB();
+  __WFE();
+  while (1) { __WFE(); }
+}
+
+// ---------------------------
 // Setup / Loop
 // ---------------------------
 void setup()
@@ -245,6 +326,7 @@ void setup()
 #endif
 
     battery_sense_init_safe();
+    motion_init();
 
     tx_packet.tag_id  = TAG_ID;
     tx_packet.seq     = 0;
@@ -269,11 +351,22 @@ void loop()
     // Tickers run in BOTH modes
     g_battery_ticker.update();
 
+    // Handle motion events (keep millis() out of ISR)
+    if (g_motion_flag) {
+      g_motion_flag = false;
+      g_last_motion_ms = millis();
+    }
+
+    // If no vibration for 15 minutes -> SYSTEMOFF
+    if ((uint32_t)(millis() - g_last_motion_ms) > MOTION_IDLE_MS) {
+      go_to_system_off();
+    }
+
 #if PROGRAMMING_MODE
     g_debug_ticker.update();
     delay(1);  // keep USB happy
 #else
-    // Tight timing: no delay, mostly sleep. We still need to wake and run update().
+    // Tight timing: no delay, mostly sleep.
     __WFE();
     __SEV();
     __WFE();

@@ -1,3 +1,18 @@
+# main.py
+# Offline viewer that MATCHES your current pass_processor.h behavior.
+# - Detection is FLOOR-referenced + tent-guard arming + hold-time start + floor stop (PASS_STOP_MODE=0)
+# - EMA uses g_cfg.ema_alpha (default 0.005)
+# - Samples with raw rssi < FLOOR are ignored entirely (no EMA update, no arming, no candidate timing) — exactly like firmware.
+#
+# Plot:
+# - Raw RSSI (gray)
+# - Firmware EMA (yellow)
+# - Predicted pass markers (red): start square, peak diamond, end circle
+# - events.csv markers (stars): start=gold, peak=magenta, end=cyan
+#
+# Also: ignores missing events.csv cleanly.
+
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -6,348 +21,22 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore
 
 
-CSV_PATH = r"c:\gitwork\xc_split_tracker\data\raw-3x3 approaches-12-20-2025.csv"
-EMA_PRESETS = (0.01, 0.05, 0.10)
-
-
-# -------------------------
-# Filters
-# -------------------------
-def ema_np(x: np.ndarray, alpha: float) -> np.ndarray:
-    """EMA: y[0]=x[0], y[i]=alpha*x[i]+(1-alpha)*y[i-1]"""
-    x = x.astype(np.float32, copy=False)
-    y = np.empty_like(x, dtype=np.float32)
-    if x.size == 0:
-        return y
-    y[0] = x[0]
-    a = np.float32(alpha)
-    om = np.float32(1.0 - alpha)
-    for i in range(1, x.size):
-        y[i] = a * x[i] + om * y[i - 1]
-    return y
-
-
-def baseline_ema_clamped(x: np.ndarray, alpha: float, clamp_up_db: float) -> np.ndarray:
-    """
-    Baseline tracker that follows downward/steady quickly, but resists being pulled upward by peaks.
-    If x is more than clamp_up_db above baseline, baseline updates are suppressed.
-    """
-    x = x.astype(np.float32, copy=False)
-    n = x.size
-    b = np.empty(n, dtype=np.float32)
-    if n == 0:
-        return b
-    a = float(alpha)
-    if a <= 0.0:
-        b[:] = x[0]
-        return b
-
-    base = float(x[0])
-    b[0] = base
-    for i in range(1, n):
-        xi = float(x[i])
-        if xi <= base + clamp_up_db:
-            base = base + a * (xi - base)
-        # else: ignore upward excursions (runner peaks)
-        b[i] = base
-    return b
-
-
-def kalman_1d_random_walk(z: np.ndarray, q: float, r: float, x0=None, p0=None) -> np.ndarray:
-    """
-    Simple 1D Kalman filter (random-walk model):
-      x_k = x_{k-1} + w,   w~N(0, q)
-      z_k = x_k + v,       v~N(0, r)
-    """
-    z = z.astype(np.float32, copy=False)
-    n = z.size
-    xhat = np.empty(n, dtype=np.float32)
-    if n == 0:
-        return xhat
-
-    x = float(z[0]) if x0 is None else float(x0)
-    p = 1.0 if p0 is None else float(p0)
-
-    q = float(max(q, 1e-12))
-    r = float(max(r, 1e-12))
-
-    for k in range(n):
-        # predict
-        p = p + q
-
-        # update
-        y = float(z[k]) - x
-        s = p + r
-        k_gain = p / s
-        x = x + k_gain * y
-        p = (1.0 - k_gain) * p
-
-        xhat[k] = x
-
-    return xhat
-
-
-# -------------------------
-# Pass detection algorithms
-# -------------------------
-def _ms_to_samples(t_ms: np.ndarray, window_ms: float) -> int:
-    """Approx convert ms->samples using median dt (robust enough)."""
-    if t_ms.size < 2:
-        return 1
-    dt = np.diff(t_ms.astype(np.int64))
-    dt = dt[dt > 0]
-    if dt.size == 0:
-        return 1
-    med = float(np.median(dt))
-    if med <= 0:
-        return 1
-    return max(1, int(round(window_ms / med)))
-
-
-def passes_opt1_baseline_hysteresis(
-    t_ms: np.ndarray,
-    x: np.ndarray,
-    base_alpha: float,
-    clamp_up_db: float,
-    delta_on_db: float,
-    delta_off_db: float,
-    min_dur_ms: int,
-    refractory_ms: int,
-):
-    """
-    Option 1: baseline + hysteresis
-      baseline = clamped EMA (won't chase peaks)
-      start when x > baseline + delta_on
-      end when x < baseline + delta_off
-    """
-    n = x.size
-    if n == 0:
-        return [], None
-
-    b = baseline_ema_clamped(x, base_alpha, clamp_up_db=clamp_up_db)
-    on_thr = b + float(delta_on_db)
-    off_thr = b + float(delta_off_db)
-
-    starts_ends = []
-    in_event = False
-    start_i = 0
-
-    refractory_until_ms = -10**18
-
-    for i in range(n):
-        ti = int(t_ms[i])
-
-        if ti < refractory_until_ms:
-            continue
-
-        if not in_event:
-            if float(x[i]) > float(on_thr[i]):
-                in_event = True
-                start_i = i
-        else:
-            # end condition
-            if float(x[i]) < float(off_thr[i]):
-                end_i = i
-                # enforce min duration
-                if int(t_ms[end_i]) - int(t_ms[start_i]) >= int(min_dur_ms):
-                    starts_ends.append((start_i, end_i))
-                    refractory_until_ms = int(t_ms[end_i]) + int(refractory_ms)
-                in_event = False
-
-    return starts_ends, b
-
-
-def _local_maxima(y: np.ndarray) -> np.ndarray:
-    """Indices i where y[i-1] < y[i] >= y[i+1]."""
-    if y.size < 3:
-        return np.array([], dtype=np.int64)
-    return np.where((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:]))[0] + 1
-
-
-def _peak_prominence_approx(y: np.ndarray, peak_idx: int, w: int) -> float:
-    """
-    Approx prominence: peak height minus max of local minima on left/right within window w.
-    """
-    n = y.size
-    i = peak_idx
-    lo = max(0, i - w)
-    hi = min(n - 1, i + w)
-
-    left_min = float(np.min(y[lo:i + 1])) if i > lo else float(y[i])
-    right_min = float(np.min(y[i:hi + 1])) if hi > i else float(y[i])
-
-    ref = max(left_min, right_min)
-    return float(y[i]) - ref
-
-
-def passes_opt2_detrended_peaks(
-    t_ms: np.ndarray,
-    x: np.ndarray,
-    base_alpha: float,
-    clamp_up_db: float,
-    prom_window_ms: int,
-    prom_min_db: float,
-    min_peak_dist_ms: int,
-    end_thresh_db: float,
-):
-    """
-    Option 2: detrended peak detection
-      baseline = clamped EMA
-      y = x - baseline
-      find peaks with prominence >= prom_min_db and separated by min_peak_dist_ms
-      for each peak, define start/end by y falling below end_thresh_db
-    """
-    n = x.size
-    if n == 0:
-        return [], None, np.array([], dtype=np.int64)
-
-    b = baseline_ema_clamped(x, base_alpha, clamp_up_db=clamp_up_db)
-    y = x.astype(np.float32) - b
-
-    w_samp = _ms_to_samples(t_ms, prom_window_ms)
-
-    peaks = _local_maxima(y)
-    if peaks.size == 0:
-        return [], b, peaks
-
-    # compute prominence and filter
-    proms = np.array([_peak_prominence_approx(y, int(pi), w_samp) for pi in peaks], dtype=np.float32)
-    keep = proms >= float(prom_min_db)
-    peaks = peaks[keep]
-    proms = proms[keep]
-
-    if peaks.size == 0:
-        return [], b, peaks
-
-    # enforce min distance in time (greedy by prominence desc)
-    order = np.argsort(-proms)  # highest prominence first
-    selected = []
-    min_dist = int(min_peak_dist_ms)
-    for idx in order:
-        p = int(peaks[idx])
-        tp = int(t_ms[p])
-        ok = True
-        for q in selected:
-            if abs(tp - int(t_ms[q])) < min_dist:
-                ok = False
-                break
-        if ok:
-            selected.append(p)
-
-    selected = np.array(sorted(selected), dtype=np.int64)
-    if selected.size == 0:
-        return [], b, selected
-
-    # segment start/end around each selected peak using y threshold
-    starts_ends = []
-    thr = float(end_thresh_db)
-
-    for j, p in enumerate(selected):
-        # left boundary: walk left until y < thr
-        i0 = int(p)
-        while i0 > 0 and float(y[i0]) >= thr:
-            i0 -= 1
-        start_i = i0
-
-        # right boundary: walk right until y < thr
-        i1 = int(p)
-        while i1 < n - 1 and float(y[i1]) >= thr:
-            i1 += 1
-        end_i = i1
-
-        # Avoid overlaps by clipping boundaries to midpoints between peaks
-        if j > 0:
-            mid_left = (int(selected[j - 1]) + int(p)) // 2
-            start_i = max(start_i, mid_left)
-        if j < selected.size - 1:
-            mid_right = (int(p) + int(selected[j + 1])) // 2
-            end_i = min(end_i, mid_right)
-
-        if end_i > start_i:
-            starts_ends.append((start_i, end_i))
-
-    return starts_ends, b, selected
-
-
-def passes_opt3_derivative(
-    t_ms: np.ndarray,
-    x: np.ndarray,
-    smooth_alpha: float,
-    base_alpha: float,
-    clamp_up_db: float,
-    slope_on_db_per_s: float,
-    slope_off_db_per_s: float,
-    height_on_db: float,
-    height_off_db: float,
-    min_dur_ms: int,
-    refractory_ms: int,
-):
-    """
-    Option 3: derivative/slope segmentation
-      xs = EMA(x, smooth_alpha)
-      baseline = clamped EMA(xs, base_alpha)
-      y = xs - baseline
-      slope = d(xs)/dt in dB/s
-      start when slope > slope_on AND y > height_on
-      end when slope < -slope_off AND y < height_off  (plus min_dur + refractory)
-    """
-    n = x.size
-    if n < 3:
-        return [], None, None
-
-    xs = ema_np(x, smooth_alpha)
-    b = baseline_ema_clamped(xs, base_alpha, clamp_up_db=clamp_up_db)
-    y = xs - b
-
-    dt_ms = np.diff(t_ms.astype(np.int64))
-    dt_ms[dt_ms <= 0] = 1
-    dx = np.diff(xs.astype(np.float32))
-    slope = (dx / dt_ms.astype(np.float32)) * 1000.0  # dB/s
-
-    print("opt3 debug:",
-          "dt_ms median", float(np.median(dt_ms)),
-          "slope min/max", float(np.min(slope)), float(np.max(slope)),
-          "y min/max", float(np.min(y)), float(np.max(y)))
-
-    starts_ends = []
-    in_event = False
-    start_i = 0
-    refractory_until_ms = -10**18
-
-    for i in range(1, n - 1):
-        ti = int(t_ms[i])
-        if ti < refractory_until_ms:
-            continue
-
-        s = float(slope[i - 1])  # slope for segment (i-1 -> i)
-
-        if not in_event:
-            if s > float(slope_on_db_per_s) and float(y[i]) > float(height_on_db):
-                in_event = True
-                start_i = i
-        else:
-            # end rule: falling slope AND back near baseline
-            if s < -float(slope_off_db_per_s) and float(y[i]) < float(height_off_db):
-                end_i = i
-                if int(t_ms[end_i]) - int(t_ms[start_i]) >= int(min_dur_ms):
-                    starts_ends.append((start_i, end_i))
-                    refractory_until_ms = int(t_ms[end_i]) + int(refractory_ms)
-                in_event = False
-
-    return starts_ends, b, xs
+#RAW_CSV_PATH = r"e:\raw.csv"
+RAW_CSV_PATH = r"C:\gitwork\xc_split_tracker\data\raw-3x3 approaches-12-20-2025.csv"
+EVENTS_CSV_PATH = r"e:\events.csv"
 
 
 # -------------------------
 # CSV load
 # -------------------------
-def load_csv_rel_ms(path: str) -> pd.DataFrame:
+def load_raw_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, engine="c")
     df.columns = [c.strip() for c in df.columns]
 
     required = {"rel_ms", "rssi", "tag_id", "pass_id"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
+        raise ValueError(f"RAW CSV missing required columns: {sorted(missing)}")
 
     for col in ["rel_ms", "rssi", "tag_id", "pass_id"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -365,74 +54,263 @@ def load_csv_rel_ms(path: str) -> pd.DataFrame:
     return df
 
 
+def load_events_csv_or_empty(path: str) -> pd.DataFrame:
+    """
+    If file is missing, return an empty df with expected columns.
+    If file exists but is malformed, raise (so you notice).
+    """
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(columns=["rel_ms", "tag_id", "pass_id", "event_type", "rssi", "unix_ms"])
+
+    df = pd.read_csv(path, engine="c")
+    df.columns = [c.strip() for c in df.columns]
+
+    required = {"rel_ms", "tag_id", "pass_id", "event_type", "rssi"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"EVENTS CSV missing required columns: {sorted(missing)}")
+
+    for col in ["rel_ms", "tag_id", "pass_id", "event_type", "rssi"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["rel_ms", "tag_id", "pass_id", "event_type", "rssi"])
+
+    df["rel_ms"] = df["rel_ms"].astype(np.int64)
+    df["tag_id"] = df["tag_id"].astype(np.int64)
+    df["pass_id"] = df["pass_id"].astype(np.int64)
+    df["event_type"] = df["event_type"].astype(np.int64)
+    df["rssi"] = df["rssi"].astype(np.float32)
+
+    if "unix_ms" in df.columns:
+        df["unix_ms"] = pd.to_numeric(df["unix_ms"], errors="coerce").astype("Int64")
+
+    df = df.sort_values("rel_ms", kind="mergesort")
+    return df
+
+
 # -------------------------
-# App
+# Firmware-exact EMA series
+# -------------------------
+def firmware_ema_series(
+    rssi: np.ndarray,
+    floor_dbm: float,
+    ema_alpha: float,
+) -> np.ndarray:
+    """
+    Matches pass_process_sample():
+      if rssi < floor: return (no EMA update)
+      if first accepted: ema = rssi
+      else ema = a*rssi + (1-a)*ema
+    For plotting, we output NaN when EMA hasn't initialized yet,
+    and we keep NaN for floor-rejected samples (later we can forward-fill for a smooth line).
+    """
+    n = rssi.size
+    y = np.empty(n, dtype=np.float32)
+    a = float(ema_alpha)
+
+    ema = None
+    for i in range(n):
+        ri = float(rssi[i])
+        if ri < float(floor_dbm):
+            y[i] = np.nan if ema is None else np.nan  # keep NaN for rejected samples (we'll ffill for plot)
+            continue
+
+        if ema is None:
+            ema = ri
+        else:
+            ema = a * ri + (1.0 - a) * float(ema)
+
+        y[i] = float(ema)
+
+    if ema is None:
+        y[:] = np.nan
+    return y
+
+
+# -------------------------
+# Firmware-matching pass detection
+# -------------------------
+def passes_firmware_floor_tent_guard(
+    t_ms: np.ndarray,
+    rssi_raw: np.ndarray,
+    floor_dbm: float,
+    ema_alpha: float,
+    delta_on_db: float,
+    delta_off_db: float,
+    min_ms: int,
+    refrac_ms: int,
+    tent_low_n: int,
+):
+    """
+    Emulates CURRENT pass_processor.h behavior:
+      - ignores samples with raw rssi < floor (no state changes)
+      - EMA over accepted samples only
+      - tent guard: requires EMA <= (floor+delta_off) for N accepted samples to arm
+      - start: armed AND EMA >= (floor+delta_on) continuously for min_ms (timed by rel_ms as wall proxy)
+      - stop: EMA <= (floor+delta_off)  (PASS_STOP_MODE=0)
+      - refractory: after end, block new start for refrac_ms
+      - peak: max EMA within pass
+    Returns:
+      triplets: list[(start_i, peak_i, end_i)]
+      ema_series: np.ndarray (same length; NaN for rejected/uninitialized samples)
+    """
+    n = t_ms.size
+    if n == 0:
+        return [], np.array([], dtype=np.float32)
+
+    arm_thr = float(floor_dbm + delta_off_db)
+    on_thr = float(floor_dbm + delta_on_db)
+    stop_thr = arm_thr  # PASS_STOP_MODE=0
+
+    ema_series = firmware_ema_series(rssi_raw, floor_dbm=floor_dbm, ema_alpha=ema_alpha)
+
+    in_pass = False
+    armed = False
+    lowN = 0
+
+    candidate_t0 = None
+    last_end_t = None
+
+    start_i = None
+    peak_i = None
+    peak_ema = None
+
+    triplets = []
+
+    # IMPORTANT: firmware timing uses now_wall_ms (millis), but rel_ms is close enough for offline.
+    for i in range(n):
+        ti = int(t_ms[i])
+        ri = float(rssi_raw[i])
+
+        # Firmware hard-gate: ignore sample completely
+        if ri < float(floor_dbm):
+            continue
+
+        ei = float(ema_series[i])
+        if np.isnan(ei):
+            continue
+
+        above_on = (ei >= on_thr)
+        below_stop = (ei <= stop_thr)
+
+        # --- Arming (only when NOT in pass and NOT armed) ---
+        if (not in_pass) and (not armed):
+            if ei <= arm_thr:
+                lowN = min(255, lowN + 1)
+                if lowN >= int(tent_low_n):
+                    armed = True
+            else:
+                lowN = 0
+
+        # --- Start logic ---
+        if not in_pass:
+            # Refractory
+            if last_end_t is not None and (ti - int(last_end_t)) < int(refrac_ms):
+                candidate_t0 = None
+                continue
+
+            if not armed:
+                candidate_t0 = None
+                continue
+
+            if above_on:
+                if candidate_t0 is None:
+                    candidate_t0 = ti
+
+                held = ti - int(candidate_t0)
+                if held >= int(min_ms):
+                    # START
+                    in_pass = True
+                    start_i = i
+                    peak_i = i
+                    peak_ema = ei
+
+                    candidate_t0 = None
+                    # firmware: after start, require re-arming again before another start
+                    armed = False
+                    lowN = 0
+            else:
+                candidate_t0 = None
+
+            continue
+
+        # --- In-pass peak tracking ---
+        if peak_ema is None or ei > float(peak_ema):
+            peak_ema = float(ei)
+            peak_i = i
+
+        # --- Stop ---
+        if below_stop:
+            end_i = i
+            triplets.append((int(start_i), int(peak_i), int(end_i)))
+
+            in_pass = False
+            last_end_t = ti
+
+            start_i = None
+            peak_i = None
+            peak_ema = None
+
+            candidate_t0 = None
+            # firmware: require low band again
+            armed = False
+            lowN = 0
+
+    return triplets, ema_series
+
+
+def forward_fill_nans(y: np.ndarray) -> np.ndarray:
+    """For nicer plotting: forward-fill NaNs (keeps leading NaNs as NaN)."""
+    if y.size == 0:
+        return y
+    out = y.copy()
+    last = np.nan
+    for i in range(out.size):
+        if np.isnan(out[i]):
+            out[i] = last
+        else:
+            last = out[i]
+    return out
+
+
+# -------------------------
+# UI
 # -------------------------
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, csv_path: str):
+    def __init__(self, raw_path: str, events_path: str):
         super().__init__()
-        self.setWindowTitle("RSSI Plot (pyqtgraph) — rel_ms + EMA + Kalman + pass detection (3 options)")
-        self.resize(1900, 980)
+        self.setWindowTitle("RSSI Plot — firmware-matching pass detector (floor + tent guard + EMA)")
+        self.resize(2000, 980)
 
-        self.df = load_csv_rel_ms(csv_path)
+        self.df_raw = load_raw_csv(raw_path)
+        self.df_evt = load_events_csv_or_empty(events_path)
 
         self.t_ms = np.array([], dtype=np.int64)
         self.rssi = np.array([], dtype=np.float32)
 
-        self.ema_items = []
-        self.kalman_item = None
-
+        # For raw panel mapping
         self.raw_header = "unix_ms,rel_ms,tag_id,pass_id,rssi"
-        self.raw_row_offset = 1
+        self.raw_row_offset = 1  # header is row 0
 
-        # --- pass marker items (square markers) ---
-        # --- pass marker items: start=square, end=circle ---
-        # Option 1 (red)
-        self.opt1_start = pg.ScatterPlotItem(symbol="s", size=9,
-                                             pen=pg.mkPen((255, 0, 0, 220)),
-                                             brush=pg.mkBrush((255, 0, 0, 160)))
-        self.opt1_end = pg.ScatterPlotItem(symbol="o", size=9,
-                                           pen=pg.mkPen((255, 0, 0, 220)),
-                                           brush=pg.mkBrush((255, 0, 0, 160)))
-
-        # Option 2 (blue)
-        self.opt2_start = pg.ScatterPlotItem(symbol="s", size=9,
-                                             pen=pg.mkPen((0, 90, 255, 220)),
-                                             brush=pg.mkBrush((0, 90, 255, 140)))
-        self.opt2_end = pg.ScatterPlotItem(symbol="o", size=9,
-                                           pen=pg.mkPen((0, 90, 255, 220)),
-                                           brush=pg.mkBrush((0, 90, 255, 140)))
-
-        # Option 3 (green)
-        self.opt3_start = pg.ScatterPlotItem(symbol="s", size=9,
-                                             pen=pg.mkPen((0, 170, 0, 220)),
-                                             brush=pg.mkBrush((0, 170, 0, 140)))
-        self.opt3_end = pg.ScatterPlotItem(symbol="o", size=9,
-                                           pen=pg.mkPen((0, 170, 0, 220)),
-                                           brush=pg.mkBrush((0, 170, 0, 140)))
-
-        # ---- UI ----
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # Controls (multi-line friendly)
         controls = QtWidgets.QGridLayout()
         controls.setHorizontalSpacing(10)
         controls.setVerticalSpacing(6)
 
-        # Row 0: filters
+        # Filters
         self.tag_combo = QtWidgets.QComboBox()
         self.pass_combo = QtWidgets.QComboBox()
 
         self.tag_combo.addItem("(all)")
-        for t in sorted(self.df["tag_id"].unique().tolist()):
+        for t in sorted(self.df_raw["tag_id"].unique().tolist()):
             self.tag_combo.addItem(str(t))
 
         self.pass_combo.addItem("(all)")
-        for p in sorted(self.df["pass_id"].unique().tolist()):
+        for p in sorted(self.df_raw["pass_id"].unique().tolist()):
             self.pass_combo.addItem(str(p))
 
         controls.addWidget(QtWidgets.QLabel("tag_id:"), 0, 0)
@@ -440,262 +318,79 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(QtWidgets.QLabel("pass_id:"), 0, 2)
         controls.addWidget(self.pass_combo, 0, 3)
 
-        # Row 0: status right
         self.status = QtWidgets.QLabel("")
         self.status.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
         controls.addWidget(self.status, 0, 9, 1, 3)
 
-        # Row 1: EMA + Kalman
-        controls.addWidget(QtWidgets.QLabel("EMA presets:"), 1, 0)
-        self.preset_checks = []
-        col = 1
-        for a in EMA_PRESETS:
-            cb = QtWidgets.QCheckBox(f"{a:g}")
-            cb.setChecked(True)
-            self.preset_checks.append(cb)
-            controls.addWidget(cb, 1, col)
-            col += 1
+        # Firmware parameters (match pass_processor.h defaults)
+        r = 1
+        controls.addWidget(QtWidgets.QLabel("Firmware params:"), r, 0)
 
-        controls.addWidget(QtWidgets.QLabel("custom α:"), 1, col)
-        col += 1
-        self.custom_alpha = QtWidgets.QLineEdit()
-        self.custom_alpha.setPlaceholderText("e.g. 0.07")
-        self.custom_alpha.setFixedWidth(70)
-        controls.addWidget(self.custom_alpha, 1, col)
-        col += 1
+        self.fw_ema_alpha = QtWidgets.QDoubleSpinBox()
+        self.fw_ema_alpha.setDecimals(6)
+        self.fw_ema_alpha.setRange(0.0, 1.0)
+        self.fw_ema_alpha.setSingleStep(0.001)
+        self.fw_ema_alpha.setValue(0.005)  # g_cfg.ema_alpha
+        self.fw_ema_alpha.setFixedWidth(90)
 
-        controls.addWidget(QtWidgets.QLabel("Kalman enable:"), 1, col)
-        col += 1
-        self.kalman_enable = QtWidgets.QCheckBox()
-        self.kalman_enable.setChecked(True)
-        controls.addWidget(self.kalman_enable, 1, col)
-        col += 1
+        self.fw_floor = QtWidgets.QDoubleSpinBox()
+        self.fw_floor.setDecimals(1)
+        self.fw_floor.setRange(-140.0, 0.0)
+        self.fw_floor.setSingleStep(1.0)
+        self.fw_floor.setValue(-100.0)  # PASS_RSSI_FLOOR_DBM
+        self.fw_floor.setFixedWidth(80)
 
-        controls.addWidget(QtWidgets.QLabel("q:"), 1, col)
-        col += 1
-        self.kalman_q = QtWidgets.QDoubleSpinBox()
-        self.kalman_q.setDecimals(9)
-        self.kalman_q.setRange(0.0, 1e6)
-        self.kalman_q.setSingleStep(1e-6)
-        self.kalman_q.setValue(0.000004)
-        self.kalman_q.setFixedWidth(120)
-        controls.addWidget(self.kalman_q, 1, col)
-        col += 1
+        self.fw_don = QtWidgets.QDoubleSpinBox()
+        self.fw_don.setDecimals(2)
+        self.fw_don.setRange(0.0, 50.0)
+        self.fw_don.setSingleStep(0.5)
+        self.fw_don.setValue(5.0)  # PASS_DELTA_ON_DB
+        self.fw_don.setFixedWidth(70)
 
-        controls.addWidget(QtWidgets.QLabel("r:"), 1, col)
-        col += 1
-        self.kalman_r = QtWidgets.QDoubleSpinBox()
-        self.kalman_r.setDecimals(6)
-        self.kalman_r.setRange(0.0, 1e6)
-        self.kalman_r.setSingleStep(0.01)
-        self.kalman_r.setValue(0.1)
-        self.kalman_r.setFixedWidth(90)
-        controls.addWidget(self.kalman_r, 1, col)
+        self.fw_doff = QtWidgets.QDoubleSpinBox()
+        self.fw_doff.setDecimals(2)
+        self.fw_doff.setRange(-50.0, 50.0)
+        self.fw_doff.setSingleStep(0.5)
+        self.fw_doff.setValue(0.0)  # PASS_DELTA_OFF_DB
+        self.fw_doff.setFixedWidth(70)
 
-        # Row 2: Option 1 params
-        r = 2
-        controls.addWidget(QtWidgets.QLabel("Opt1 (red) baseline+HYS:"), r, 0)
+        self.fw_min_ms = QtWidgets.QSpinBox()
+        self.fw_min_ms.setRange(0, 600000)
+        self.fw_min_ms.setSingleStep(10)
+        self.fw_min_ms.setValue(200)  # PASS_MIN_MS
+        self.fw_min_ms.setFixedWidth(80)
 
-        self.o1_base_alpha = QtWidgets.QDoubleSpinBox()
-        self.o1_base_alpha.setDecimals(6)
-        self.o1_base_alpha.setRange(0.0, 1.0)
-        self.o1_base_alpha.setSingleStep(0.0005)
-        self.o1_base_alpha.setValue(0.002)
-        self.o1_base_alpha.setFixedWidth(90)
+        self.fw_refrac = QtWidgets.QSpinBox()
+        self.fw_refrac.setRange(0, 600000)
+        self.fw_refrac.setSingleStep(50)
+        self.fw_refrac.setValue(5000)  # PASS_REFRAC_MS
+        self.fw_refrac.setFixedWidth(90)
 
-        self.o1_clamp = QtWidgets.QDoubleSpinBox()
-        self.o1_clamp.setDecimals(2)
-        self.o1_clamp.setRange(0.0, 50.0)
-        self.o1_clamp.setSingleStep(0.5)
-        self.o1_clamp.setValue(2.0)
-        self.o1_clamp.setFixedWidth(70)
-
-        self.o1_on = QtWidgets.QDoubleSpinBox()
-        self.o1_on.setDecimals(2)
-        self.o1_on.setRange(0.0, 50.0)
-        self.o1_on.setSingleStep(0.5)
-        self.o1_on.setValue(4.0)
-        self.o1_on.setFixedWidth(70)
-
-        self.o1_off = QtWidgets.QDoubleSpinBox()
-        self.o1_off.setDecimals(2)
-        self.o1_off.setRange(0.0, 50.0)
-        self.o1_off.setSingleStep(0.5)
-        self.o1_off.setValue(2.0)
-        self.o1_off.setFixedWidth(70)
-
-        self.o1_min_dur = QtWidgets.QSpinBox()
-        self.o1_min_dur.setRange(0, 600000)
-        self.o1_min_dur.setSingleStep(10)
-        self.o1_min_dur.setValue(120)
-        self.o1_min_dur.setFixedWidth(80)
-
-        self.o1_refrac = QtWidgets.QSpinBox()
-        self.o1_refrac.setRange(0, 600000)
-        self.o1_refrac.setSingleStep(50)
-        self.o1_refrac.setValue(250)
-        self.o1_refrac.setFixedWidth(80)
+        self.fw_tentN = QtWidgets.QSpinBox()
+        self.fw_tentN.setRange(0, 255)
+        self.fw_tentN.setSingleStep(1)
+        self.fw_tentN.setValue(3)  # PASS_TENT_REQUIRE_LOW_BAND_SAMPLES
+        self.fw_tentN.setFixedWidth(60)
 
         c = 1
-        controls.addWidget(QtWidgets.QLabel("base α"), r, c); c += 1
-        controls.addWidget(self.o1_base_alpha, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("clamp↑dB"), r, c); c += 1
-        controls.addWidget(self.o1_clamp, r, c); c += 1
+        controls.addWidget(QtWidgets.QLabel("ema α"), r, c); c += 1
+        controls.addWidget(self.fw_ema_alpha, r, c); c += 1
+        controls.addWidget(QtWidgets.QLabel("floor"), r, c); c += 1
+        controls.addWidget(self.fw_floor, r, c); c += 1
         controls.addWidget(QtWidgets.QLabel("Δon"), r, c); c += 1
-        controls.addWidget(self.o1_on, r, c); c += 1
+        controls.addWidget(self.fw_don, r, c); c += 1
         controls.addWidget(QtWidgets.QLabel("Δoff"), r, c); c += 1
-        controls.addWidget(self.o1_off, r, c); c += 1
+        controls.addWidget(self.fw_doff, r, c); c += 1
         controls.addWidget(QtWidgets.QLabel("min ms"), r, c); c += 1
-        controls.addWidget(self.o1_min_dur, r, c); c += 1
+        controls.addWidget(self.fw_min_ms, r, c); c += 1
         controls.addWidget(QtWidgets.QLabel("refrac ms"), r, c); c += 1
-        controls.addWidget(self.o1_refrac, r, c)
+        controls.addWidget(self.fw_refrac, r, c); c += 1
+        controls.addWidget(QtWidgets.QLabel("tent N"), r, c); c += 1
+        controls.addWidget(self.fw_tentN, r, c)
 
-        # Row 3: Option 2 params
-        r = 3
-        controls.addWidget(QtWidgets.QLabel("Opt2 (blue) detrend+peaks:"), r, 0)
-
-        self.o2_base_alpha = QtWidgets.QDoubleSpinBox()
-        self.o2_base_alpha.setDecimals(6)
-        self.o2_base_alpha.setRange(0.0, 1.0)
-        self.o2_base_alpha.setSingleStep(0.0005)
-        self.o2_base_alpha.setValue(0.002)
-        self.o2_base_alpha.setFixedWidth(90)
-
-        self.o2_clamp = QtWidgets.QDoubleSpinBox()
-        self.o2_clamp.setDecimals(2)
-        self.o2_clamp.setRange(0.0, 50.0)
-        self.o2_clamp.setSingleStep(0.5)
-        self.o2_clamp.setValue(2.0)
-        self.o2_clamp.setFixedWidth(70)
-
-        self.o2_prom_win = QtWidgets.QSpinBox()
-        self.o2_prom_win.setRange(10, 600000)
-        self.o2_prom_win.setSingleStep(50)
-        self.o2_prom_win.setValue(600)  # ms
-        self.o2_prom_win.setFixedWidth(80)
-
-        self.o2_prom_min = QtWidgets.QDoubleSpinBox()
-        self.o2_prom_min.setDecimals(2)
-        self.o2_prom_min.setRange(0.0, 50.0)
-        self.o2_prom_min.setSingleStep(0.5)
-        self.o2_prom_min.setValue(5.0)
-        self.o2_prom_min.setFixedWidth(70)
-
-        self.o2_dist = QtWidgets.QSpinBox()
-        self.o2_dist.setRange(0, 600000)
-        self.o2_dist.setSingleStep(50)
-        self.o2_dist.setValue(400)
-        self.o2_dist.setFixedWidth(80)
-
-        self.o2_end_thr = QtWidgets.QDoubleSpinBox()
-        self.o2_end_thr.setDecimals(2)
-        self.o2_end_thr.setRange(-50.0, 50.0)
-        self.o2_end_thr.setSingleStep(0.5)
-        self.o2_end_thr.setValue(1.5)
-        self.o2_end_thr.setFixedWidth(70)
-
-        c = 1
-        controls.addWidget(QtWidgets.QLabel("base α"), r, c); c += 1
-        controls.addWidget(self.o2_base_alpha, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("clamp↑dB"), r, c); c += 1
-        controls.addWidget(self.o2_clamp, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("prom win ms"), r, c); c += 1
-        controls.addWidget(self.o2_prom_win, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("prom min"), r, c); c += 1
-        controls.addWidget(self.o2_prom_min, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("min dist ms"), r, c); c += 1
-        controls.addWidget(self.o2_dist, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("end thr"), r, c); c += 1
-        controls.addWidget(self.o2_end_thr, r, c)
-
-        # Row 4: Option 3 params
-        r = 4
-        controls.addWidget(QtWidgets.QLabel("Opt3 (green) derivative:"), r, 0)
-
-        self.o3_smooth_alpha = QtWidgets.QDoubleSpinBox()
-        self.o3_smooth_alpha.setDecimals(4)
-        self.o3_smooth_alpha.setRange(0.0, 1.0)
-        self.o3_smooth_alpha.setSingleStep(0.01)
-        self.o3_smooth_alpha.setValue(0.1)
-        self.o3_smooth_alpha.setFixedWidth(80)
-
-        self.o3_base_alpha = QtWidgets.QDoubleSpinBox()
-        self.o3_base_alpha.setDecimals(6)
-        self.o3_base_alpha.setRange(0.0, 1.0)
-        self.o3_base_alpha.setSingleStep(0.0005)
-        self.o3_base_alpha.setValue(0.002)
-        self.o3_base_alpha.setFixedWidth(90)
-
-        self.o3_clamp = QtWidgets.QDoubleSpinBox()
-        self.o3_clamp.setDecimals(2)
-        self.o3_clamp.setRange(0.0, 50.0)
-        self.o3_clamp.setSingleStep(0.5)
-        self.o3_clamp.setValue(2.0)
-        self.o3_clamp.setFixedWidth(70)
-
-        self.o3_slope_on = QtWidgets.QDoubleSpinBox()
-        self.o3_slope_on.setDecimals(1)
-        self.o3_slope_on.setRange(0.0, 5000.0)
-        self.o3_slope_on.setSingleStep(50.0)
-        self.o3_slope_on.setValue(300.0)
-        self.o3_slope_on.setFixedWidth(90)
-
-        self.o3_slope_off = QtWidgets.QDoubleSpinBox()
-        self.o3_slope_off.setDecimals(1)
-        self.o3_slope_off.setRange(0.0, 5000.0)
-        self.o3_slope_off.setSingleStep(50.0)
-        self.o3_slope_off.setValue(300.0)
-        self.o3_slope_off.setFixedWidth(90)
-
-        self.o3_h_on = QtWidgets.QDoubleSpinBox()
-        self.o3_h_on.setDecimals(2)
-        self.o3_h_on.setRange(0.0, 50.0)
-        self.o3_h_on.setSingleStep(0.5)
-        self.o3_h_on.setValue(2.0)
-        self.o3_h_on.setFixedWidth(70)
-
-        self.o3_h_off = QtWidgets.QDoubleSpinBox()
-        self.o3_h_off.setDecimals(2)
-        self.o3_h_off.setRange(0.0, 50.0)
-        self.o3_h_off.setSingleStep(0.5)
-        self.o3_h_off.setValue(1.5)
-        self.o3_h_off.setFixedWidth(70)
-
-        self.o3_min_dur = QtWidgets.QSpinBox()
-        self.o3_min_dur.setRange(0, 600000)
-        self.o3_min_dur.setSingleStep(10)
-        self.o3_min_dur.setValue(120)
-        self.o3_min_dur.setFixedWidth(80)
-
-        self.o3_refrac = QtWidgets.QSpinBox()
-        self.o3_refrac.setRange(0, 600000)
-        self.o3_refrac.setSingleStep(50)
-        self.o3_refrac.setValue(250)
-        self.o3_refrac.setFixedWidth(80)
-
-        c = 1
-        controls.addWidget(QtWidgets.QLabel("smooth α"), r, c); c += 1
-        controls.addWidget(self.o3_smooth_alpha, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("base α"), r, c); c += 1
-        controls.addWidget(self.o3_base_alpha, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("clamp↑dB"), r, c); c += 1
-        controls.addWidget(self.o3_clamp, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("slope on dB/s"), r, c); c += 1
-        controls.addWidget(self.o3_slope_on, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("slope off dB/s"), r, c); c += 1
-        controls.addWidget(self.o3_slope_off, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("h on"), r, c); c += 1
-        controls.addWidget(self.o3_h_on, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("h off"), r, c); c += 1
-        controls.addWidget(self.o3_h_off, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("min ms"), r, c); c += 1
-        controls.addWidget(self.o3_min_dur, r, c); c += 1
-        controls.addWidget(QtWidgets.QLabel("refrac ms"), r, c); c += 1
-        controls.addWidget(self.o3_refrac, r, c)
-
-        # Row 5: Apply
-        self.apply_btn = QtWidgets.QPushButton("Apply overlays")
-        controls.addWidget(self.apply_btn, 5, 0, 1, 2)
+        # Apply button
+        self.apply_btn = QtWidgets.QPushButton("Recompute")
+        controls.addWidget(self.apply_btn, 2, 0, 1, 2)
 
         root.addLayout(controls)
 
@@ -716,9 +411,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.raw_list = QtWidgets.QListWidget()
         self.raw_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.raw_list.setAlternatingRowColors(True)
-        self.raw_list.setStyleSheet("""
-            QListWidget::item:selected { background: #2b6cb0; color: white; }
-        """)
+        self.raw_list.setStyleSheet("""QListWidget::item:selected { background: #2b6cb0; color: white; }""")
         raw_layout.addWidget(self.raw_list, 1)
         splitter.addWidget(raw_panel)
         splitter.setStretchFactor(0, 3)
@@ -732,7 +425,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.setMouseEnabled(x=True, y=True)
         self.axis = self.plot.getAxis("bottom")
 
-        # Raw series: line + markers
+        # Raw series
         self.raw_line = pg.PlotDataItem(pen=pg.mkPen((110, 130, 150, 120), width=1))
         self.raw_line.setDownsampling(auto=True, method="peak")
         self.raw_line.setClipToView(True)
@@ -747,43 +440,54 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.plot.addItem(self.raw_scatter)
 
-        # Add pass markers (above everything)
-        self.plot.addItem(self.opt1_start)
-        self.plot.addItem(self.opt1_end)
-        self.plot.addItem(self.opt2_start)
-        self.plot.addItem(self.opt2_end)
-        self.plot.addItem(self.opt3_start)
-        self.plot.addItem(self.opt3_end)
+        # Firmware EMA (yellow)
+        self.fw_ema_line = pg.PlotDataItem(pen=pg.mkPen((255, 180, 0, 220), width=2))
+        self.fw_ema_line.setDownsampling(auto=True, method="peak")
+        self.fw_ema_line.setClipToView(True)
+        self.plot.addItem(self.fw_ema_line)
 
-        # Clicking points -> highlight row
+        # Predicted markers (red)
+        self.calc_start = pg.ScatterPlotItem(symbol="s", size=10,
+                                             pen=pg.mkPen((255, 0, 0, 230)),
+                                             brush=pg.mkBrush((255, 0, 0, 160)))
+        self.calc_peak = pg.ScatterPlotItem(symbol="d", size=10,
+                                            pen=pg.mkPen((255, 0, 0, 230)),
+                                            brush=pg.mkBrush((255, 0, 0, 160)))
+        self.calc_end = pg.ScatterPlotItem(symbol="o", size=10,
+                                           pen=pg.mkPen((255, 0, 0, 230)),
+                                           brush=pg.mkBrush((255, 0, 0, 160)))
+        self.plot.addItem(self.calc_start)
+        self.plot.addItem(self.calc_peak)
+        self.plot.addItem(self.calc_end)
+
+        # events.csv markers (stars)
+        self.evt_start = pg.ScatterPlotItem(symbol="star", size=12,
+                                            pen=pg.mkPen((255, 215, 0, 240)),
+                                            brush=pg.mkBrush((255, 215, 0, 120)))
+        self.evt_peak = pg.ScatterPlotItem(symbol="star", size=12,
+                                           pen=pg.mkPen((255, 0, 255, 240)),
+                                           brush=pg.mkBrush((255, 0, 255, 110)))
+        self.evt_end = pg.ScatterPlotItem(symbol="star", size=12,
+                                          pen=pg.mkPen((0, 255, 255, 240)),
+                                          brush=pg.mkBrush((0, 255, 255, 110)))
+        self.plot.addItem(self.evt_start)
+        self.plot.addItem(self.evt_peak)
+        self.plot.addItem(self.evt_end)
+
+        # Clicking raw points -> highlight row
         self.raw_scatter.sigClicked.connect(self.on_points_clicked)
 
-        # Wire signals
-        self.apply_btn.clicked.connect(self.recompute_overlays)
-        self.custom_alpha.returnPressed.connect(self.recompute_overlays)
+        # Wiring
+        self.apply_btn.clicked.connect(self.recompute)
         self.tag_combo.currentIndexChanged.connect(self.on_filter_changed)
         self.pass_combo.currentIndexChanged.connect(self.on_filter_changed)
 
-        for cb in self.preset_checks:
-            cb.stateChanged.connect(self.recompute_overlays)
-
-        self.kalman_enable.stateChanged.connect(self.recompute_overlays)
-        self.kalman_q.valueChanged.connect(self.recompute_overlays)
-        self.kalman_r.valueChanged.connect(self.recompute_overlays)
-
-        # Pass params -> live recompute
-        for w in [
-            self.o1_base_alpha, self.o1_clamp, self.o1_on, self.o1_off, self.o1_min_dur, self.o1_refrac,
-            self.o2_base_alpha, self.o2_clamp, self.o2_prom_win, self.o2_prom_min, self.o2_dist, self.o2_end_thr,
-            self.o3_smooth_alpha, self.o3_base_alpha, self.o3_clamp, self.o3_slope_on, self.o3_slope_off,
-            self.o3_h_on, self.o3_h_off, self.o3_min_dur, self.o3_refrac,
-        ]:
-            if isinstance(w, QtWidgets.QSpinBox) or isinstance(w, QtWidgets.QDoubleSpinBox):
-                w.valueChanged.connect(self.recompute_overlays)
+        for w in [self.fw_ema_alpha, self.fw_floor, self.fw_don, self.fw_doff, self.fw_min_ms, self.fw_refrac, self.fw_tentN]:
+            w.valueChanged.connect(self.recompute)
 
         # Initial
         self.apply_filters_and_plot_raw()
-        self.recompute_overlays()
+        self.recompute()
 
     # -------------------------
     # Raw panel linking
@@ -796,32 +500,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.raw_list.scrollToItem(item, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def on_points_clicked(self, plot_item, points):
-        if points is None:
-            return
-        try:
-            n = len(points)
-        except Exception:
-            return
-        if n == 0:
+        if not points:
             return
         p0 = points[0]
-        try:
-            idx = p0.data()
-        except Exception:
-            idx = None
+        idx = p0.data()
         if idx is None:
             return
         self.highlight_row(int(idx))
 
     # -------------------------
-    # Data + plotting
+    # Filtering + plotting
     # -------------------------
     def on_filter_changed(self):
         self.apply_filters_and_plot_raw()
-        self.recompute_overlays()
+        self.recompute()
 
     def apply_filters_and_plot_raw(self):
-        df = self.df
+        df = self.df_raw
 
         tag_text = self.tag_combo.currentText()
         pass_text = self.pass_combo.currentText()
@@ -837,7 +532,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rssi = np.array([], dtype=np.float32)
             self.raw_scatter.setData([], [])
             self.raw_line.setData([], [])
+            self.fw_ema_line.setData([], [])
             self.raw_list.clear()
+            self.calc_start.setData([], [])
+            self.calc_peak.setData([], [])
+            self.calc_end.setData([], [])
+            self.evt_start.setData([], [])
+            self.evt_peak.setData([], [])
+            self.evt_end.setData([], [])
             return
 
         t_ms = df["rel_ms"].to_numpy(dtype=np.int64)
@@ -849,30 +551,27 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = np.arange(len(t_ms), dtype=np.int32)
         self.raw_scatter.setData(x=t_ms, y=rssi, data=idx)
 
-        # Raw panel
+        # Raw list
         self.raw_list.clear()
         self.raw_list.addItem(self.raw_header)
 
         has_unix = "unix_ms" in df.columns
         unix_vals = df["unix_ms"].to_numpy(dtype="int64", na_value=-1) if has_unix else None
 
-        rel_vals = t_ms
         tag_vals = df["tag_id"].to_numpy(dtype=np.int64)
         pass_vals = df["pass_id"].to_numpy(dtype=np.int64)
-        rssi_vals = rssi
 
-        for i in range(len(rel_vals)):
+        for i in range(len(t_ms)):
             u_str = ""
             if has_unix:
                 u = unix_vals[i]
                 u_str = "" if u == -1 else str(int(u))
-            line = f"{u_str},{int(rel_vals[i])},{int(tag_vals[i])},{int(pass_vals[i])},{int(round(float(rssi_vals[i])))}"
+            line = f"{u_str},{int(t_ms[i])},{int(tag_vals[i])},{int(pass_vals[i])},{int(round(float(rssi[i])))}"
             self.raw_list.addItem(line)
 
-        # X ticks: major 1000ms, minor 100ms
+        # ticks
         x0 = float(t_ms[0])
         x1 = float(t_ms[-1])
-
         major_start = np.floor(x0 / 1000.0) * 1000.0
         major_end = np.ceil(x1 / 1000.0) * 1000.0
         major_vals = np.arange(major_start, major_end + 1000.0, 1000.0)
@@ -886,175 +585,127 @@ class MainWindow(QtWidgets.QMainWindow):
         self.axis.setTicks([major_ticks, minor_ticks])
 
         self.plot.setXRange(x0, x1, padding=0.01)
-        self.status.setText(f"{len(t_ms):,} samples  (rel_ms {int(x0)}..{int(x1)})")
 
     # -------------------------
-    # Overlays
+    # Markers
     # -------------------------
-    def get_selected_alphas(self):
-        alphas = []
-        for cb in self.preset_checks:
-            if cb.isChecked():
-                try:
-                    alphas.append(float(cb.text()))
-                except ValueError:
-                    pass
-
-        s = self.custom_alpha.text().strip()
-        if s:
-            try:
-                a = float(s)
-                if 0.0 < a <= 1.0:
-                    alphas.append(a)
-            except ValueError:
-                pass
-
-        return sorted(set(alphas))
-
-    def clear_ema_items(self):
-        for item in self.ema_items:
-            try:
-                self.plot.removeItem(item)
-            except Exception:
-                pass
-        self.ema_items = []
-
-    def clear_kalman_item(self):
-        if self.kalman_item is not None:
-            try:
-                self.plot.removeItem(self.kalman_item)
-            except Exception:
-                pass
-            self.kalman_item = None
-
-    def set_pass_markers(self, passes, start_item, end_item, y_series=None):
-        if y_series is None:
-            y_series = self.rssi
-
-        if not passes:
-            start_item.setData([], [])
-            end_item.setData([], [])
+    def set_triplet_markers(self, triplets, y_series: np.ndarray):
+        if not triplets:
+            self.calc_start.setData([], [])
+            self.calc_peak.setData([], [])
+            self.calc_end.setData([], [])
             return
 
         xs_s, ys_s = [], []
+        xs_p, ys_p = [], []
         xs_e, ys_e = [], []
         n = self.t_ms.size
 
-        for s, e in passes:
-            s = int(s);
-            e = int(e)
+        for s, p, e in triplets:
+            s = int(s); p = int(p); e = int(e)
             if 0 <= s < n:
-                xs_s.append(float(self.t_ms[s]));
-                ys_s.append(float(y_series[s]))
+                xs_s.append(float(self.t_ms[s]))
+                ys_s.append(float(y_series[s]) if not np.isnan(y_series[s]) else float(self.rssi[s]))
+            if 0 <= p < n:
+                xs_p.append(float(self.t_ms[p]))
+                ys_p.append(float(y_series[p]) if not np.isnan(y_series[p]) else float(self.rssi[p]))
             if 0 <= e < n:
-                xs_e.append(float(self.t_ms[e]));
-                ys_e.append(float(y_series[e]))
+                xs_e.append(float(self.t_ms[e]))
+                ys_e.append(float(y_series[e]) if not np.isnan(y_series[e]) else float(self.rssi[e]))
 
-        start_item.setData(xs_s, ys_s)
-        end_item.setData(xs_e, ys_e)
+        self.calc_start.setData(xs_s, ys_s)
+        self.calc_peak.setData(xs_p, ys_p)
+        self.calc_end.setData(xs_e, ys_e)
 
-    def recompute_overlays(self):
-        if self.t_ms is None or self.rssi is None or self.t_ms.size == 0:
+    def set_event_star_markers(self, df_evt_filtered: pd.DataFrame):
+        if df_evt_filtered is None or df_evt_filtered.empty:
+            self.evt_start.setData([], [])
+            self.evt_peak.setData([], [])
+            self.evt_end.setData([], [])
             return
 
-        # -------------------------
-        # EMA overlays (on raw RSSI)
-        # -------------------------
-        self.clear_ema_items()
-        alphas = self.get_selected_alphas()
-        if alphas:
-            pens = [
-                pg.mkPen((255, 165, 0, 220), width=2),
-                pg.mkPen((50, 205, 50, 220), width=2),
-                pg.mkPen((220, 20, 60, 220), width=2),
-                pg.mkPen((30, 144, 255, 220), width=2),
-                pg.mkPen((148, 0, 211, 220), width=2),
-                pg.mkPen((0, 206, 209, 220), width=2),
-            ]
-            for i, a in enumerate(alphas):
-                y = ema_np(self.rssi, a)
-                curve = self.plot.plot(self.t_ms, y, pen=pens[i % len(pens)])
-                curve.setDownsampling(auto=True, method="peak")
-                curve.setClipToView(True)
-                self.ema_items.append(curve)
+        t = df_evt_filtered["rel_ms"].to_numpy(dtype=np.int64)
+        y = df_evt_filtered["rssi"].to_numpy(dtype=np.float32)
+        et = df_evt_filtered["event_type"].to_numpy(dtype=np.int64)
 
-        # -------------------------
-        # Kalman overlay
-        # -------------------------
-        self.clear_kalman_item()
+        m1 = (et == 1)
+        m2 = (et == 2)
+        m3 = (et == 3)
 
-        yk = None
-        if self.kalman_enable.isChecked():
-            q = float(self.kalman_q.value())
-            r = float(self.kalman_r.value())
-            yk = kalman_1d_random_walk(self.rssi, q=q, r=r)
+        self.evt_start.setData(t[m1].astype(np.float64), y[m1].astype(np.float64))
+        self.evt_peak.setData(t[m2].astype(np.float64), y[m2].astype(np.float64))
+        self.evt_end.setData(t[m3].astype(np.float64), y[m3].astype(np.float64))
 
-            self.kalman_item = self.plot.plot(
-                self.t_ms,
-                yk,
-                pen=pg.mkPen((148, 0, 211, 230), width=3),  # purple
-            )
-            self.kalman_item.setDownsampling(auto=True, method="peak")
-            self.kalman_item.setClipToView(True)
+    # -------------------------
+    # Recompute overlays
+    # -------------------------
+    def recompute(self):
+        if self.t_ms is None or self.t_ms.size == 0:
+            return
 
-        # Use Kalman-smoothed data for detection if available; otherwise fall back to raw
-        x_det = yk if yk is not None else self.rssi
+        floor_dbm = float(self.fw_floor.value())
+        ema_alpha = float(self.fw_ema_alpha.value())
+        delta_on = float(self.fw_don.value())
+        delta_off = float(self.fw_doff.value())
+        min_ms = int(self.fw_min_ms.value())
+        refrac_ms = int(self.fw_refrac.value())
+        tentN = int(self.fw_tentN.value())
 
-        # -------------------------
-        # Pass detection (3 options) on x_det
-        # Markers are positioned using x_det so they sit on the smooth curve.
-        # -------------------------
-        opt1, _b1 = passes_opt1_baseline_hysteresis(
-            self.t_ms, x_det,
-            base_alpha=float(self.o1_base_alpha.value()),
-            clamp_up_db=float(self.o1_clamp.value()),
-            delta_on_db=float(self.o1_on.value()),
-            delta_off_db=float(self.o1_off.value()),
-            min_dur_ms=int(self.o1_min_dur.value()),
-            refractory_ms=int(self.o1_refrac.value()),
+        triplets, ema_series = passes_firmware_floor_tent_guard(
+            self.t_ms,
+            self.rssi,
+            floor_dbm=floor_dbm,
+            ema_alpha=ema_alpha,
+            delta_on_db=delta_on,
+            delta_off_db=delta_off,
+            min_ms=min_ms,
+            refrac_ms=refrac_ms,
+            tent_low_n=tentN,
         )
-        self.set_pass_markers(opt1, self.opt1_start, self.opt1_end, y_series=x_det)
 
-        opt2, _b2, _peaks = passes_opt2_detrended_peaks(
-            self.t_ms, x_det,
-            base_alpha=float(self.o2_base_alpha.value()),
-            clamp_up_db=float(self.o2_clamp.value()),
-            prom_window_ms=int(self.o2_prom_win.value()),
-            prom_min_db=float(self.o2_prom_min.value()),
-            min_peak_dist_ms=int(self.o2_dist.value()),
-            end_thresh_db=float(self.o2_end_thr.value()),
-        )
-        self.set_pass_markers(opt2, self.opt2_start, self.opt2_end, y_series=x_det)
+        # Firmware EMA line (yellow): forward-fill for display
+        if ema_series.size:
+            y_plot = forward_fill_nans(ema_series)
+            self.fw_ema_line.setData(self.t_ms, y_plot)
+        else:
+            self.fw_ema_line.setData([], [])
 
-        opt3, _b3, _xs = passes_opt3_derivative(
-            self.t_ms, x_det,
-            smooth_alpha=float(self.o3_smooth_alpha.value()),
-            base_alpha=float(self.o3_base_alpha.value()),
-            clamp_up_db=float(self.o3_clamp.value()),
-            slope_on_db_per_s=float(self.o3_slope_on.value()),
-            slope_off_db_per_s=float(self.o3_slope_off.value()),
-            height_on_db=float(self.o3_h_on.value()),
-            height_off_db=float(self.o3_h_off.value()),
-            min_dur_ms=int(self.o3_min_dur.value()),
-            refractory_ms=int(self.o3_refrac.value()),
-        )
-        self.set_pass_markers(opt3, self.opt3_start, self.opt3_end, y_series=x_det)
+        # Red markers at firmware EMA values
+        self.set_triplet_markers(triplets, y_series=ema_series)
+
+        # events.csv stars filtered to selection
+        df_evt = self.df_evt
+        tag_text = self.tag_combo.currentText()
+        pass_text = self.pass_combo.currentText()
+
+        if tag_text != "(all)":
+            df_evt = df_evt[df_evt["tag_id"] == int(tag_text)]
+        if pass_text != "(all)":
+            df_evt = df_evt[df_evt["pass_id"] == int(pass_text)]
+
+        if self.t_ms.size:
+            x0 = int(self.t_ms[0])
+            x1 = int(self.t_ms[-1])
+            if not df_evt.empty:
+                df_evt = df_evt[(df_evt["rel_ms"] >= x0) & (df_evt["rel_ms"] <= x1)]
+
+        self.set_event_star_markers(df_evt)
 
         self.status.setText(
-            f"{self.t_ms.size:,} samples | passes: opt1={len(opt1)} opt2={len(opt2)} opt3={len(opt3)}"
+            f"{self.t_ms.size:,} samples | fw ema α={ema_alpha:g} floor={floor_dbm:g} "
+            f"Δon={delta_on:g} Δoff={delta_off:g} min={min_ms} refrac={refrac_ms} tentN={tentN} "
+            f"| fw passes={len(triplets)} | events={0 if df_evt is None else len(df_evt)}"
         )
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-
-    # Sometimes faster for lots of line segments; if it causes issues, comment out.
     try:
         pg.setConfigOptions(useOpenGL=True)
     except Exception:
         pass
 
-    w = MainWindow(CSV_PATH)
+    w = MainWindow(RAW_CSV_PATH, EVENTS_CSV_PATH)
     w.show()
     sys.exit(app.exec())
 

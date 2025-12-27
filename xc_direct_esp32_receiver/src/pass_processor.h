@@ -1,10 +1,15 @@
+// pass_processor.h
 #pragma once
 #include <Arduino.h>
 #include <math.h>
 
 #include "config.h"
 #include "types.h"
+#include "display.h"   // UI updates only when a pass is FINISHED
 
+// =====================================================
+// External globals (as before)
+// =====================================================
 extern RuntimeConfig g_cfg;
 extern TagContext g_tags[MAX_TAGS];
 extern volatile uint32_t g_total_events;
@@ -12,7 +17,8 @@ extern volatile uint32_t g_total_events;
 using EventSinkFn = void(*)(const Event&);
 
 static EventSinkFn g_sink = nullptr;
-static uint32_t g_next_pass_id = 1;
+static uint32_t    g_next_pass_id = 1;
+static volatile uint32_t g_passes_completed = 0;
 
 // =====================================================
 // Debug controls
@@ -25,10 +31,6 @@ static uint32_t g_next_pass_id = 1;
 #define PASS_DEBUG_PERIOD_MS 1000
 #endif
 
-#ifndef PASS_DEBUG_CROSSING_COOLDOWN_MS
-#define PASS_DEBUG_CROSSING_COOLDOWN_MS 250
-#endif
-
 #if PASS_DEBUG
   #define PASS_DBG_PRINTF(...) do { Serial.printf(__VA_ARGS__); } while (0)
 #else
@@ -36,77 +38,104 @@ static uint32_t g_next_pass_id = 1;
 #endif
 
 // =====================================================
-// Anti-flap controls
+// Streaming "prominence / drop" peak-pass detector params
+// Mirrors the Python defaults/behavior closely
 // =====================================================
-#ifndef PASS_START_CONFIRM_SAMPLES
-#define PASS_START_CONFIRM_SAMPLES 3
+#ifndef PASS_PROMINENCE_DB
+#define PASS_PROMINENCE_DB (10.0f)      // rise above valley to begin tracking
 #endif
 
-#ifndef PASS_STOP_CONFIRM_SAMPLES
-#define PASS_STOP_CONFIRM_SAMPLES 3
+#ifndef PASS_DROP_DB
+#define PASS_DROP_DB (10.0f)            // drop from peak to end
 #endif
 
-#ifndef PASS_MIN_PASS_MS
-#define PASS_MIN_PASS_MS 400
+#ifndef PASS_MAX_PASS_TIME_MS
+#define PASS_MAX_PASS_TIME_MS (20000u) // timeout from pass start (valley time)
 #endif
 
-#ifndef PASS_MIN_GAP_MS
-#define PASS_MIN_GAP_MS 250
+#ifndef PASS_MIN_SEP_MS
+#define PASS_MIN_SEP_MS (0u)           // optional extra separation between passes
 #endif
 
 // =====================================================
-// Per-slot debug / state (kept outside TagContext)
+// Per-tag detector state (ONE instance per tag slot)
+// Kept outside TagContext to avoid duplicating TagContext.
 // =====================================================
+struct PeakPassState {
+  // EMA
+  bool  ema_init = false;
+  float ema      = 0.0f;
+
+  // tracking state
+  bool tracking = false;
+
+  // valley (idle minimum)
+  float    valley        = 0.0f;
+  uint32_t valley_wall   = 0;     // "now_wall_ms" at valley
+  uint32_t valley_rel    = 0;     // rel_ms at valley
+  int8_t   valley_rssi   = 0;     // raw at valley (best effort)
+
+  // pass start (defined at valley)
+  uint32_t start_wall = 0;
+  uint32_t start_rel  = 0;
+  int8_t   start_rssi = 0;
+
+  // peak (while tracking)
+  float    peak        = 0.0f;
+  uint32_t peak_wall   = 0;
+  uint32_t peak_rel    = 0;
+  int8_t   peak_rssi   = 0;       // rounded from peak EMA (like Python)
+
+  // last finish (for min separation)
+  uint32_t last_finish_wall = 0;
+};
+
+// One state per slot
+static PeakPassState s_pp[MAX_TAGS];
+
+// Optional periodic debug timing per slot
 static uint32_t s_dbg_last_print_wall[MAX_TAGS] = {0};
-static uint32_t s_dbg_last_cross_wall[MAX_TAGS] = {0};
-static uint32_t s_dbg_samples[MAX_TAGS] = {0};
-static int8_t   s_dbg_prev_above_start[MAX_TAGS] = {0}; // 0 unknown, 1 above, 2 below
 
-static uint8_t  s_start_up_cnt[MAX_TAGS]    = {0};
-static uint8_t  s_stop_down_cnt[MAX_TAGS]   = {0};
-static uint32_t s_pass_start_wall[MAX_TAGS] = {0};
-static uint32_t s_last_end_wall[MAX_TAGS]   = {0};
-
+// =====================================================
+// API
+// =====================================================
 inline void pass_set_event_sink(EventSinkFn fn) { g_sink = fn; }
 
-// Clamp helper
+inline uint32_t pass_get_completed_count() { return (uint32_t)g_passes_completed; }
+inline void pass_reset_completed_count()  { g_passes_completed = 0; }
+
+// =====================================================
+// Helpers
+// =====================================================
 static inline int8_t clamp_i8(int16_t v) {
   if (v < -127) v = -127;
   if (v >  127) v =  127;
   return (int8_t)v;
 }
 
-// TRUE hysteresis band:
-// start_thr = thr + hyst (harder to start)
-// stop_thr  = thr - hyst (harder to stop)
-static inline int8_t start_threshold_i8() {
-  return clamp_i8((int16_t)g_cfg.threshold_dbm + (int16_t)g_cfg.hysteresis_db);
-}
-static inline int8_t stop_threshold_i8() {
-  return clamp_i8((int16_t)g_cfg.threshold_dbm - (int16_t)g_cfg.hysteresis_db);
+// "round away from zero" to match python _round_away_from_zero
+static inline int8_t round_away_from_zero_i8(float x) {
+  int16_t v = (x >= 0.0f) ? (int16_t)(x + 0.5f) : (int16_t)(x - 0.5f);
+  return clamp_i8(v);
 }
 
+static inline void emit(TagContext &ctx, uint32_t rel_ms, EventType t, int8_t rssi) {
+  Event e{rel_ms, ctx.pass_id, ctx.tag_id, t, rssi};
+  if (g_sink) g_sink(e);
+  g_total_events++;
+}
+
+// =====================================================
+// Tag slot management (same style as your existing code)
+// =====================================================
 inline void pass_init() {
   for (uint8_t i = 0; i < MAX_TAGS; ++i) {
     g_tags[i] = TagContext{};
-
+    s_pp[i]   = PeakPassState{};
     s_dbg_last_print_wall[i] = 0;
-    s_dbg_last_cross_wall[i] = 0;
-    s_dbg_samples[i] = 0;
-    s_dbg_prev_above_start[i] = 0;
-
-    s_start_up_cnt[i] = 0;
-    s_stop_down_cnt[i] = 0;
-    s_pass_start_wall[i] = 0;
-    s_last_end_wall[i] = 0;
   }
   g_next_pass_id = 1;
-}
-
-inline uint8_t pass_get_tag_count() {
-  uint8_t c = 0;
-  for (uint8_t i = 0; i < MAX_TAGS; ++i) if (g_tags[i].used) c++;
-  return c;
+  g_passes_completed = 0;
 }
 
 // Returns ctx and slot index.
@@ -117,258 +146,222 @@ inline TagContext* pass_get_ctx(uint16_t tag_id, uint8_t* out_idx = nullptr) {
       return &g_tags[i];
     }
   }
+
   for (uint8_t i = 0; i < MAX_TAGS; ++i) {
     if (!g_tags[i].used) {
       g_tags[i].used = true;
       g_tags[i].tag_id = tag_id;
       if (out_idx) *out_idx = i;
 
-#if PASS_DEBUG
-      PASS_DBG_PRINTF("[PASS] new tag slot=%u tag=%u thr=%d hyst=%d start=%d stop=%d alpha=%.2f startN=%u stopN=%u minpass=%lums mingap=%lums\n",
-                      (unsigned)i, (unsigned)tag_id,
-                      (int)g_cfg.threshold_dbm, (int)g_cfg.hysteresis_db,
-                      (int)start_threshold_i8(), (int)stop_threshold_i8(),
-                      (double)g_cfg.ema_alpha,
-                      (unsigned)PASS_START_CONFIRM_SAMPLES,
-                      (unsigned)PASS_STOP_CONFIRM_SAMPLES,
-                      (unsigned long)PASS_MIN_PASS_MS,
-                      (unsigned long)PASS_MIN_GAP_MS);
-#endif
+      // reset state for this slot
+      g_tags[i].ema_init = false;
+      g_tags[i].ema      = 0.0f;
+      g_tags[i].in_pass  = false;
+      g_tags[i].pass_id  = 0;
+      g_tags[i].peak_ema = 0.0f;
+      g_tags[i].peak_rel_ms = 0;
 
-      // reset per-slot
+      s_pp[i] = PeakPassState{};
       s_dbg_last_print_wall[i] = 0;
-      s_dbg_last_cross_wall[i] = 0;
-      s_dbg_samples[i] = 0;
-      s_dbg_prev_above_start[i] = 0;
 
-      s_start_up_cnt[i] = 0;
-      s_stop_down_cnt[i] = 0;
-      s_pass_start_wall[i] = 0;
-      s_last_end_wall[i] = 0;
-
+#if PASS_DEBUG
+      PASS_DBG_PRINTF("[PASS] new tag slot=%u tag=%u ema_alpha=%.6f prom=%.2f drop=%.2f maxPass=%lums minSep=%lums\n",
+                      (unsigned)i, (unsigned)tag_id,
+                      (double)g_cfg.ema_alpha,
+                      (double)PASS_PROMINENCE_DB,
+                      (double)PASS_DROP_DB,
+                      (unsigned long)PASS_MAX_PASS_TIME_MS,
+                      (unsigned long)PASS_MIN_SEP_MS);
+#endif
       return &g_tags[i];
     }
   }
   return nullptr;
 }
 
-inline void emit(TagContext &ctx, uint32_t rel_ms, EventType t, int8_t rssi) {
-  Event e{rel_ms, ctx.pass_id, ctx.tag_id, t, rssi};
-  if (g_sink) g_sink(e);
-  g_total_events++;
-}
-
-static inline void dbg_periodic(uint8_t idx, const TagContext& ctx, uint32_t now_wall_ms) {
-#if PASS_DEBUG
-  if (PASS_DEBUG_PERIOD_MS == 0) return;
-  if (s_dbg_last_print_wall[idx] == 0 || (now_wall_ms - s_dbg_last_print_wall[idx]) >= PASS_DEBUG_PERIOD_MS) {
-    s_dbg_last_print_wall[idx] = now_wall_ms;
-
-    const int thr      = (int)g_cfg.threshold_dbm;
-    const int start_thr = (int)start_threshold_i8();
-    const int stop_thr  = (int)stop_threshold_i8();
-    const uint32_t age  = (ctx.in_pass && s_pass_start_wall[idx]) ? (now_wall_ms - s_pass_start_wall[idx]) : 0;
-
-    PASS_DBG_PRINTF("[PASS] tag=%u samp=%lu in=%u pass=%lu rssi=%d ema=%.2f thr=%d start=%d stop=%d peak=%.2f@%lu rel=%lu wall=%lu upN=%u dnN=%u age=%lums\n",
-                    (unsigned)ctx.tag_id,
-                    (unsigned long)s_dbg_samples[idx],
-                    (unsigned)ctx.in_pass,
-                    (unsigned long)ctx.pass_id,
-                    (int)ctx.last_rssi,
-                    (double)ctx.ema,
-                    thr, start_thr, stop_thr,
-                    (double)ctx.peak_ema,
-                    (unsigned long)ctx.peak_rel_ms,
-                    (unsigned long)ctx.last_rel_ms,
-                    (unsigned long)ctx.last_wall_ms,
-                    (unsigned)s_start_up_cnt[idx],
-                    (unsigned)s_stop_down_cnt[idx],
-                    (unsigned long)age);
-  }
-#endif
-}
-
-static inline void dbg_crossing_start(uint8_t idx, const TagContext& ctx, uint32_t now_wall_ms, bool now_above_start) {
-#if PASS_DEBUG
-  if (s_dbg_prev_above_start[idx] == 0) {
-    s_dbg_prev_above_start[idx] = now_above_start ? 1 : 2;
-    return;
-  }
-  const bool was_above = (s_dbg_prev_above_start[idx] == 1);
-  if (was_above != now_above_start) {
-    if (s_dbg_last_cross_wall[idx] == 0 ||
-        (now_wall_ms - s_dbg_last_cross_wall[idx]) >= PASS_DEBUG_CROSSING_COOLDOWN_MS) {
-      s_dbg_last_cross_wall[idx] = now_wall_ms;
-      PASS_DBG_PRINTF("[PASS] tag=%u %s start=%d rssi=%d ema=%.2f in=%u pass=%lu rel=%lu\n",
-                      (unsigned)ctx.tag_id,
-                      now_above_start ? "CROSS_UP" : "CROSS_DOWN",
-                      (int)start_threshold_i8(),
-                      (int)ctx.last_rssi,
-                      (double)ctx.ema,
-                      (unsigned)ctx.in_pass,
-                      (unsigned long)ctx.pass_id,
-                      (unsigned long)ctx.last_rel_ms);
-    }
-    s_dbg_prev_above_start[idx] = now_above_start ? 1 : 2;
-  }
-#endif
-}
-
-static inline void pass_start(uint8_t idx, TagContext &ctx, uint32_t rel_ms, int8_t rssi, uint32_t now_wall_ms) {
-  ctx.in_pass     = true;
-  ctx.pass_id     = g_next_pass_id++;
-  ctx.peak_ema    = ctx.ema;
-  ctx.peak_rel_ms = rel_ms;
-
-  ctx.last_rel_ms  = rel_ms;
-  ctx.last_rssi    = rssi;
-  ctx.last_wall_ms = now_wall_ms;
-
-  s_pass_start_wall[idx] = now_wall_ms;
-  s_stop_down_cnt[idx] = 0;
-
-#if PASS_DEBUG
-  PASS_DBG_PRINTF("[PASS] START tag=%u pass=%lu rel=%lu rssi=%d ema=%.2f start=%d (upcnt=%u)\n",
-                  (unsigned)ctx.tag_id,
-                  (unsigned long)ctx.pass_id,
-                  (unsigned long)rel_ms,
-                  (int)rssi,
-                  (double)ctx.ema,
-                  (int)start_threshold_i8(),
-                  (unsigned)s_start_up_cnt[idx]);
-#endif
-
-  emit(ctx, rel_ms, EventType::Start, rssi);
-}
-
-static inline void pass_finish(uint8_t idx, TagContext &ctx) {
-  if (!ctx.in_pass) return;
-
-#if PASS_DEBUG
-  const uint32_t age = (s_pass_start_wall[idx] ? (ctx.last_wall_ms - s_pass_start_wall[idx]) : 0);
-  PASS_DBG_PRINTF("[PASS] END tag=%u pass=%lu last_rel=%lu last_rssi=%d peak=%.2f@%lu stop=%d start=%d (downcnt=%u age=%lums)\n",
-                  (unsigned)ctx.tag_id,
-                  (unsigned long)ctx.pass_id,
-                  (unsigned long)ctx.last_rel_ms,
-                  (int)ctx.last_rssi,
-                  (double)ctx.peak_ema,
-                  (unsigned long)ctx.peak_rel_ms,
-                  (int)stop_threshold_i8(),
-                  (int)start_threshold_i8(),
-                  (unsigned)s_stop_down_cnt[idx],
-                  (unsigned long)age);
-#endif
-
-  emit(ctx, ctx.peak_rel_ms, EventType::Peak, (int8_t)lroundf(ctx.peak_ema));
-  emit(ctx, ctx.last_rel_ms, EventType::End, ctx.last_rssi);
-
+// =====================================================
+// Core per-tag processing (mirror Python PeakPass1Py)
+// This is the key: pass_process_sample does "lookup + delegate"
+// =====================================================
+static inline void pass_finish_and_emit(uint8_t idx, TagContext& ctx, PeakPassState& st,
+                                       uint32_t end_rel_ms, int8_t end_rssi) {
+  // "pass" identity
   ctx.in_pass = false;
+
+  // Emit events
+  emit(ctx, st.peak_rel, EventType::Peak, st.peak_rssi);
+  emit(ctx, end_rel_ms,  EventType::End,  end_rssi);
+
+  // UI update + counter
+  StatusDisplay::note_pass(ctx.tag_id);
+  g_passes_completed++;
+
+  // clear TagContext pass fields
   ctx.pass_id = 0;
 
-  s_last_end_wall[idx] = ctx.last_wall_ms;
-  s_start_up_cnt[idx] = 0;
-  s_stop_down_cnt[idx] = 0;
+  // min separation bookkeeping
+  st.last_finish_wall = ctx.last_wall_ms;
+
+  // reset valley at current sample (Python does this at end)
+  st.tracking      = false;
+  st.valley        = st.ema;
+  st.valley_wall   = ctx.last_wall_ms;
+  st.valley_rel    = end_rel_ms;
+  st.valley_rssi   = end_rssi;
 }
 
-inline void pass_process_sample(uint32_t rel_ms, uint16_t tag_id, int8_t rssi, uint32_t now_wall_ms) {
-  uint8_t idx = 0;
-  TagContext *ctx = pass_get_ctx(tag_id, &idx);
-  if (!ctx) return;
+static inline void process_one_tag_sample(uint8_t idx, TagContext& ctx, PeakPassState& st,
+                                         uint32_t rel_ms, int8_t raw_rssi, uint32_t now_wall_ms) {
+  // keep latest samples in ctx (same as before)
+  ctx.last_rel_ms  = rel_ms;
+  ctx.last_rssi    = raw_rssi;
+  ctx.last_wall_ms = now_wall_ms;
 
-  s_dbg_samples[idx]++;
+  // --- EMA (must match Python exactly) ---
+  const float x = (float)raw_rssi;
+  if (!st.ema_init) {
+    st.ema_init = true;
+    st.ema = x;
 
-  ctx->last_rel_ms  = rel_ms;
-  ctx->last_rssi    = rssi;
-  ctx->last_wall_ms = now_wall_ms;
+    // mirror TagContext EMA fields too (handy for logging/inspection)
+    ctx.ema_init = true;
+    ctx.ema = st.ema;
 
-  // EMA
-  if (!ctx->ema_init) {
-    ctx->ema = (float)rssi;
-    ctx->ema_init = true;
-  } else {
-    const float a = g_cfg.ema_alpha;
-    ctx->ema = a * (float)rssi + (1.0f - a) * ctx->ema;
-  }
-
-  const float start_thr = (float)start_threshold_i8();
-  const float stop_thr  = (float)stop_threshold_i8();
-
-  const bool now_above_start = (ctx->ema >= start_thr);
-  dbg_crossing_start(idx, *ctx, now_wall_ms, now_above_start);
-  dbg_periodic(idx, *ctx, now_wall_ms);
-
-  // -------------------------
-  // NOT in pass: start logic
-  // -------------------------
-  if (!ctx->in_pass) {
-    if (PASS_MIN_GAP_MS > 0) {
-      const uint32_t since_end = now_wall_ms - s_last_end_wall[idx];
-      if (s_last_end_wall[idx] != 0 && since_end < PASS_MIN_GAP_MS) {
-        s_start_up_cnt[idx] = 0;
-        return;
-      }
-    }
-
-    if (now_above_start) {
-      if (s_start_up_cnt[idx] < 255) s_start_up_cnt[idx]++;
-    } else {
-      s_start_up_cnt[idx] = 0;
-    }
-
-    if (s_start_up_cnt[idx] >= PASS_START_CONFIRM_SAMPLES) {
-      pass_start(idx, *ctx, rel_ms, rssi, now_wall_ms);
-      s_start_up_cnt[idx] = 0;
-    }
+    // init valley to first EMA
+    st.valley      = st.ema;
+    st.valley_wall = now_wall_ms;
+    st.valley_rel  = rel_ms;
+    st.valley_rssi = raw_rssi;
     return;
   }
 
-  // -------------------------
-  // IN pass: peak tracking
-  // -------------------------
-  if (ctx->ema > ctx->peak_ema) {
-    ctx->peak_ema    = ctx->ema;
-    ctx->peak_rel_ms = rel_ms;
-  }
+  const float a = (float)g_cfg.ema_alpha;
+  st.ema = a * x + (1.0f - a) * st.ema;
 
-  // Minimum pass duration
-  if (PASS_MIN_PASS_MS > 0 && s_pass_start_wall[idx] != 0) {
-    const uint32_t age = now_wall_ms - s_pass_start_wall[idx];
-    if (age < PASS_MIN_PASS_MS) {
-      s_stop_down_cnt[idx] = 0;
+  ctx.ema_init = true;
+  ctx.ema = st.ema;
+
+  const float e = st.ema;
+
+  // --- MIN_SEP block (but still track valley) ---
+  if (!st.tracking && PASS_MIN_SEP_MS > 0 && st.last_finish_wall != 0) {
+    const uint32_t since = now_wall_ms - st.last_finish_wall;
+    if (since < (uint32_t)PASS_MIN_SEP_MS) {
+      if (e < st.valley) {
+        st.valley      = e;
+        st.valley_wall = now_wall_ms;
+        st.valley_rel  = rel_ms;
+        st.valley_rssi = raw_rssi;
+      }
       return;
     }
   }
 
-  // -------------------------
-  // IN pass: stop logic
-  // -------------------------
-  if (ctx->ema <= stop_thr) {
-    if (s_stop_down_cnt[idx] < 255) s_stop_down_cnt[idx]++;
-  } else {
-    s_stop_down_cnt[idx] = 0;
-  }
+  // --- IDLE: update valley, start tracking on prominence ---
+  if (!st.tracking) {
+    if (e < st.valley) {
+      st.valley      = e;
+      st.valley_wall = now_wall_ms;
+      st.valley_rel  = rel_ms;
+      st.valley_rssi = raw_rssi;
+    }
 
-  if (s_stop_down_cnt[idx] >= PASS_STOP_CONFIRM_SAMPLES) {
-    pass_finish(idx, *ctx);
-  }
-}
+    if (e >= (st.valley + (float)PASS_PROMINENCE_DB)) {
+      st.tracking = true;
 
-inline void pass_check_idle_timeouts(uint32_t now_wall_ms) {
-  if (g_cfg.idle_end_ms == 0) return;
+      // Start time is valley time (Python definition)
+      st.start_wall = st.valley_wall;
+      st.start_rel  = st.valley_rel;
+      st.start_rssi = st.valley_rssi;
 
-  for (uint8_t i = 0; i < MAX_TAGS; ++i) {
-    TagContext &ctx = g_tags[i];
-    if (!ctx.used || !ctx.in_pass) continue;
+      // Assign a new pass id NOW (when tracking begins)
+      ctx.in_pass = true;
+      ctx.pass_id = g_next_pass_id++;
 
-    if ((now_wall_ms - ctx.last_wall_ms) >= g_cfg.idle_end_ms) {
+      // peak init at current sample
+      st.peak      = e;
+      st.peak_wall = now_wall_ms;
+      st.peak_rel  = rel_ms;
+      st.peak_rssi = round_away_from_zero_i8(e);
+
+      // also store in ctx for debug/telemetry
+      ctx.peak_ema    = st.peak;
+      ctx.peak_rel_ms = st.peak_rel;
+
 #if PASS_DEBUG
-      PASS_DBG_PRINTF("[PASS] IDLE_END tag=%u pass=%lu idle_ms=%lu cfg=%lu\n",
+      PASS_DBG_PRINTF("[PASS] START(tag=%u pass=%lu) valley=%.2f@%lu ema=%.2f rel=%lu\n",
                       (unsigned)ctx.tag_id,
                       (unsigned long)ctx.pass_id,
-                      (unsigned long)(now_wall_ms - ctx.last_wall_ms),
-                      (unsigned long)g_cfg.idle_end_ms);
+                      (double)st.valley, (unsigned long)st.start_rel,
+                      (double)e, (unsigned long)rel_ms);
 #endif
-      pass_finish(i, ctx);
+      emit(ctx, st.start_rel, EventType::Start, st.start_rssi);
+    }
+    return;
+  }
+
+  // --- TRACKING: update peak ---
+  if (e > st.peak) {
+    st.peak      = e;
+    st.peak_wall = now_wall_ms;
+    st.peak_rel  = rel_ms;
+    st.peak_rssi = round_away_from_zero_i8(e);
+
+    ctx.peak_ema    = st.peak;
+    ctx.peak_rel_ms = st.peak_rel;
+  }
+
+  // --- End conditions: drop from peak OR timeout ---
+  const bool dropped   = (e <= (st.peak - (float)PASS_DROP_DB));
+  const bool timed_out = (PASS_MAX_PASS_TIME_MS > 0) &&
+                         ((now_wall_ms - st.start_wall) >= (uint32_t)PASS_MAX_PASS_TIME_MS);
+
+  if (dropped || timed_out) {
+#if PASS_DEBUG
+    const uint32_t age = now_wall_ms - st.start_wall;
+    PASS_DBG_PRINTF("[PASS] END(tag=%u pass=%lu) peak=%.2f@%lu endEma=%.2f rel=%lu age=%lums %s\n",
+                    (unsigned)ctx.tag_id,
+                    (unsigned long)ctx.pass_id,
+                    (double)st.peak, (unsigned long)st.peak_rel,
+                    (double)e, (unsigned long)rel_ms,
+                    (unsigned long)age,
+                    dropped ? "DROP" : "TIMEOUT");
+#endif
+    pass_finish_and_emit(idx, ctx, st, rel_ms, raw_rssi);
+  }
+
+#if PASS_DEBUG
+  if (PASS_DEBUG_PERIOD_MS > 0) {
+    if (s_dbg_last_print_wall[idx] == 0 || (now_wall_ms - s_dbg_last_print_wall[idx]) >= (uint32_t)PASS_DEBUG_PERIOD_MS) {
+      s_dbg_last_print_wall[idx] = now_wall_ms;
+      PASS_DBG_PRINTF("[PASS] tag=%u in=%u pass=%lu rssi=%d ema=%.2f valley=%.2f@%lu peak=%.2f@%lu rel=%lu\n",
+                      (unsigned)ctx.tag_id,
+                      (unsigned)ctx.in_pass,
+                      (unsigned long)ctx.pass_id,
+                      (int)raw_rssi,
+                      (double)e,
+                      (double)st.valley, (unsigned long)st.valley_rel,
+                      (double)st.peak, (unsigned long)st.peak_rel,
+                      (unsigned long)rel_ms);
     }
   }
+#endif
+}
+
+// =====================================================
+// Top-level entry: find tag slot and delegate.
+// No loops other than tag slot lookup (same as your current layout).
+// =====================================================
+inline void pass_process_sample(uint32_t rel_ms, uint16_t tag_id, int8_t rssi, uint32_t now_wall_ms) {
+  uint8_t idx = 0;
+  TagContext* ctx = pass_get_ctx(tag_id, &idx);
+  if (!ctx) return;
+
+  process_one_tag_sample(idx, *ctx, s_pp[idx], rel_ms, rssi, now_wall_ms);
+}
+
+// No longer needed in this algorithm, but keep stub for compatibility
+inline void pass_check_idle_timeouts(uint32_t now_wall_ms) {
+  (void)now_wall_ms;
+  // This detector ends passes by drop-from-peak or timeout inside process_one_tag_sample().
 }

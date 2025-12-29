@@ -25,7 +25,7 @@
 // Mode switch
 // ---------------------------
 #ifndef PROGRAMMING_MODE
-//#define PROGRAMMING_MODE 1
+#define PROGRAMMING_MODE 1
 #endif
 
 #if PROGRAMMING_MODE
@@ -37,12 +37,13 @@
 // ---------------------------
 static constexpr uint8_t VBAT_EN  = 14;  // P0.14 / D14 (active LOW)
 static constexpr uint8_t VBAT_ADC = 32;  // P0.31 (ADC input)
-
+static constexpr uint8_t LED_PIN = LED_BUILTIN;
 // ---------------------------
 // Motion sleep pins/config
 // ---------------------------
 static constexpr uint8_t  MOTION_PIN     = D2;                 // XIAO D2
-static constexpr uint32_t MOTION_IDLE_MS = 15UL * 60UL * 1000UL; // 15 minutes
+//static constexpr uint32_t MOTION_IDLE_MS = 15UL * 60UL * 1000UL; // 15 minutes
+static constexpr uint32_t MOTION_IDLE_MS = 15UL * 1000UL; // 15 seconds
 
 static volatile bool     g_motion_flag    = false;
 static volatile uint32_t g_last_motion_ms = 0;
@@ -50,7 +51,7 @@ static volatile uint32_t g_last_motion_ms = 0;
 // ---------------------------
 // Config
 // ---------------------------
-#define TAG_ID                      2
+#define TAG_ID                      4
 #define TX_INTERVAL_MS              5
 #define BATTERY_SAMPLE_INTERVAL_MS  2000
 
@@ -142,8 +143,9 @@ static void on_motion_isr()
 static void motion_init()
 {
   // External ~1M pull-up to 3V3, switch to GND
+  pinMode(MOTION_PIN, INPUT_PULLUP);
   pinMode(MOTION_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(MOTION_PIN), on_motion_isr, FALLING);
+  attachInterrupt(digitalPinToInterrupt(MOTION_PIN), on_motion_isr, CHANGE);
 
   g_last_motion_ms = millis();
 }
@@ -160,6 +162,7 @@ static void on_debug_tick()
   Serial.print((uint32_t)g_batt_health);
   Serial.print(" idle_ms=");
   Serial.println((uint32_t)(millis() - g_last_motion_ms));
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
 }
 static Ticker g_debug_ticker(on_debug_tick, DEBUG_INTERVAL_MS, 0, MILLIS);
 
@@ -281,6 +284,7 @@ static void go_to_system_off()
 #if PROGRAMMING_MODE
   Serial.println("Entering SYSTEMOFF (no motion)...");
   Serial.flush();
+  digitalWrite(LED_PIN,0);
 #endif
 
   // Stop periodic TX schedule
@@ -304,6 +308,7 @@ static void go_to_system_off()
   nrf_gpio_cfg_sense_input(
       nrf_pin,
       NRF_GPIO_PIN_NOPULL,     // external pull-up handles it
+      //NRF_GPIO_PIN_PULLUP,
       NRF_GPIO_PIN_SENSE_LOW   // wake when pin goes LOW
   );
 
@@ -321,6 +326,7 @@ static void go_to_system_off()
 void setup()
 {
 #if PROGRAMMING_MODE
+    pinMode(LED_PIN, OUTPUT);
     Serial.begin(UART_BAUD);
     wait_for_serial();
 #endif

@@ -15,6 +15,11 @@
 #  - EMA (yellow)
 #  - Predicted pass markers (red): start CIRCLE, peak DIAMOND, end SQUARE
 #  - events.csv markers (stars): start=gold, peak=magenta, end=cyan
+#
+# NEW:
+#  - Two checkboxes to toggle overlays:
+#      * Show predicted (calc)
+#      * Show actual (events.csv)
 
 import os
 import sys
@@ -28,8 +33,10 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore
 
 
-RAW_CSV_PATH = r"C:\gitwork\xc_split_tracker\data\raw-3x3 approaches-12-20-2025.csv"
-EVENTS_CSV_PATH = r"e:\events.csv"
+RAW_CSV_PATH = r"E:\raw_12_31_1969.csv"
+EVENTS_CSV_PATH = r"e:\events_12_31_1969.csv"
+# RAW_CSV_PATH = r"C:\gitwork\xc_split_tracker\data\raw-3x3 approaches-12-20-2025.csv"
+# EVENTS_CSV_PATH = r"e:\events.csv"
 
 # -------------------------
 # Detector constants
@@ -37,7 +44,7 @@ EVENTS_CSV_PATH = r"e:\events.csv"
 PROMINENCE_DB = 10.0       # rise above valley to start pass tracking
 DROP_DB = 10.0             # drop from peak to end
 MAX_PASS_TIME_MS = 20_000
-MIN_SEP_MS = 0            # set e.g. 300-800 if you want extra de-bounce between passes
+MIN_SEP_MS = 0             # set e.g. 300-800 if you want extra de-bounce between passes
 
 
 def _round_away_from_zero(x: float) -> int:
@@ -304,8 +311,7 @@ class PassManagerPy:
         ema_series = np.empty(n, dtype=np.float32)
         triplets: List[Tuple[int, int, int]] = []
 
-        # For converting rel_ms back to indices quickly for this filtered view:
-        # rel_ms may repeat, so map to last index; that’s fine for plotting markers.
+        # rel_ms may repeat; map to last index (fine for plotting markers)
         rel_to_i: Dict[int, int] = {}
         for i in range(n):
             rel_to_i[int(t_ms[i])] = i
@@ -418,6 +424,16 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(QtWidgets.QLabel("drop dB"), r, c); c += 1
         controls.addWidget(self.drop, r, c)
 
+        # Overlay toggles
+        self.cb_show_pred = QtWidgets.QCheckBox("Show predicted (calc)")
+        self.cb_show_pred.setChecked(True)
+
+        self.cb_show_evt = QtWidgets.QCheckBox("Show actual (events.csv)")
+        self.cb_show_evt.setChecked(True)
+
+        controls.addWidget(self.cb_show_pred, 2, 2, 1, 2)
+        controls.addWidget(self.cb_show_evt, 2, 4, 1, 3)
+
         self.apply_btn = QtWidgets.QPushButton("Recompute")
         controls.addWidget(self.apply_btn, 2, 0, 1, 2)
 
@@ -476,29 +492,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.addItem(self.ema_line)
 
         # Predicted markers (red): start circle, peak diamond, end square
-        self.calc_start = pg.ScatterPlotItem(symbol="o", size=10,
-                                             pen=pg.mkPen((255, 0, 0, 230)),
-                                             brush=pg.mkBrush((255, 0, 0, 160)))
-        self.calc_peak = pg.ScatterPlotItem(symbol="d", size=10,
-                                            pen=pg.mkPen((255, 0, 0, 230)),
-                                            brush=pg.mkBrush((255, 0, 0, 160)))
-        self.calc_end = pg.ScatterPlotItem(symbol="s", size=10,
-                                           pen=pg.mkPen((255, 0, 0, 230)),
-                                           brush=pg.mkBrush((255, 0, 0, 160)))
+        self.calc_start = pg.ScatterPlotItem(
+            symbol="o", size=10,
+            pen=pg.mkPen((255, 0, 0, 230)),
+            brush=pg.mkBrush((255, 0, 0, 160)),
+        )
+        self.calc_peak = pg.ScatterPlotItem(
+            symbol="d", size=10,
+            pen=pg.mkPen((255, 0, 0, 230)),
+            brush=pg.mkBrush((255, 0, 0, 160)),
+        )
+        self.calc_end = pg.ScatterPlotItem(
+            symbol="s", size=10,
+            pen=pg.mkPen((255, 0, 0, 230)),
+            brush=pg.mkBrush((255, 0, 0, 160)),
+        )
         self.plot.addItem(self.calc_start)
         self.plot.addItem(self.calc_peak)
         self.plot.addItem(self.calc_end)
 
         # events.csv markers (stars)
-        self.evt_start = pg.ScatterPlotItem(symbol="star", size=12,
-                                            pen=pg.mkPen((255, 215, 0, 240)),
-                                            brush=pg.mkBrush((255, 215, 0, 120)))
-        self.evt_peak = pg.ScatterPlotItem(symbol="star", size=12,
-                                           pen=pg.mkPen((255, 0, 255, 240)),
-                                           brush=pg.mkBrush((255, 0, 255, 110)))
-        self.evt_end = pg.ScatterPlotItem(symbol="star", size=12,
-                                          pen=pg.mkPen((0, 255, 255, 240)),
-                                          brush=pg.mkBrush((0, 255, 255, 110)))
+        self.evt_start = pg.ScatterPlotItem(
+            symbol="star", size=12,
+            pen=pg.mkPen((255, 215, 0, 240)),
+            brush=pg.mkBrush((255, 215, 0, 120)),
+        )
+        self.evt_peak = pg.ScatterPlotItem(
+            symbol="star", size=12,
+            pen=pg.mkPen((255, 0, 255, 240)),
+            brush=pg.mkBrush((255, 0, 255, 110)),
+        )
+        self.evt_end = pg.ScatterPlotItem(
+            symbol="star", size=12,
+            pen=pg.mkPen((0, 255, 255, 240)),
+            brush=pg.mkBrush((0, 255, 255, 110)),
+        )
         self.plot.addItem(self.evt_start)
         self.plot.addItem(self.evt_peak)
         self.plot.addItem(self.evt_end)
@@ -514,6 +542,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ema_alpha.valueChanged.connect(self.recompute)
         self.prominence.valueChanged.connect(self.recompute)
         self.drop.valueChanged.connect(self.recompute)
+
+        self.cb_show_pred.toggled.connect(self.recompute)
+        self.cb_show_evt.toggled.connect(self.recompute)
 
         # Initial
         self.apply_filters_and_plot_raw()
@@ -681,8 +712,25 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         triplets, ema_series = mgr.run_series(self.t_ms, self.rssi, self.tag_ids, ema_alpha=ema_alpha)
 
+        # Always update EMA (useful context even if overlays are hidden)
         self.ema_line.setData(self.t_ms, ema_series)
-        self.set_triplet_markers(triplets, ema_series)
+
+        show_pred = bool(self.cb_show_pred.isChecked())
+        show_evt = bool(self.cb_show_evt.isChecked())
+
+        # Predicted markers
+        if show_pred:
+            self.set_triplet_markers(triplets, ema_series)
+            self.calc_start.show()
+            self.calc_peak.show()
+            self.calc_end.show()
+        else:
+            self.calc_start.setData([], [])
+            self.calc_peak.setData([], [])
+            self.calc_end.setData([], [])
+            self.calc_start.hide()
+            self.calc_peak.hide()
+            self.calc_end.hide()
 
         # events.csv stars filtered to selection
         df_evt = self.df_evt
@@ -699,7 +747,18 @@ class MainWindow(QtWidgets.QMainWindow):
             x1 = int(self.t_ms[-1])
             df_evt = df_evt[(df_evt["rel_ms"] >= x0) & (df_evt["rel_ms"] <= x1)]
 
-        self.set_event_star_markers(df_evt)
+        if show_evt:
+            self.set_event_star_markers(df_evt)
+            self.evt_start.show()
+            self.evt_peak.show()
+            self.evt_end.show()
+        else:
+            self.evt_start.setData([], [])
+            self.evt_peak.setData([], [])
+            self.evt_end.setData([], [])
+            self.evt_start.hide()
+            self.evt_peak.hide()
+            self.evt_end.hide()
 
         self.status.setText(
             f"{self.t_ms.size:,} samples | ema α={ema_alpha:g} | prom={prom:g}dB drop={drop:g}dB | "

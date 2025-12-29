@@ -42,11 +42,11 @@ static volatile uint32_t g_passes_completed = 0;
 // Mirrors the Python defaults/behavior closely
 // =====================================================
 #ifndef PASS_PROMINENCE_DB
-#define PASS_PROMINENCE_DB (10.0f)      // rise above valley to begin tracking
+#define PASS_PROMINENCE_DB (7.0f)      // rise above valley to begin tracking
 #endif
 
 #ifndef PASS_DROP_DB
-#define PASS_DROP_DB (10.0f)            // drop from peak to end
+#define PASS_DROP_DB (7.0f)            // drop from peak to end
 #endif
 
 #ifndef PASS_MAX_PASS_TIME_MS
@@ -54,7 +54,7 @@ static volatile uint32_t g_passes_completed = 0;
 #endif
 
 #ifndef PASS_MIN_SEP_MS
-#define PASS_MIN_SEP_MS (0u)           // optional extra separation between passes
+#define PASS_MIN_SEP_MS (20000u)           // optional extra separation between passes
 #endif
 
 // =====================================================

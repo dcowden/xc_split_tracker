@@ -20,7 +20,7 @@
 #include <nrf.h>
 #include <Ticker.h>
 #include <nrf_gpio.h>
-
+#include "nicenano_pins.h"
 // ---------------------------
 // Mode switch
 // ---------------------------
@@ -33,15 +33,26 @@
 #endif
 
 // ---------------------------
-// XIAO nRF52840 battery sense pins
+// XIAO nRF52840  pins
 // ---------------------------
-static constexpr uint8_t VBAT_EN  = 14;  // P0.14 / D14 (active LOW)
-static constexpr uint8_t VBAT_ADC = 32;  // P0.31 (ADC input)
+//static constexpr uint8_t VBAT_EN  = 14;  // P0.14 / D14 (active LOW)
+//static constexpr uint8_t VBAT_ADC = 32;  // P0.31 (ADC input)
+//static constexpr float    VBAT_SCALE      = 3.0f;   
+//static constexpr uint8_t LED_PIN = LED_BUILTIN;
+//static constexpr uint8_t  MOTION_PIN     = D2;
+
+// ---------------------------
+// NiceNano Pins
+// NiceNano does not have a built-in divider. so if we want to measure batt voltage
+// we'll have to add one ourself
+// ---------------------------
+static constexpr uint8_t VBAT_EN  = 14;  //not needed on nicenano
+static constexpr uint8_t VBAT_ADC = A2;  // P0.31 (ADC input)
+static constexpr float    VBAT_SCALE      = 2.0f;   
 static constexpr uint8_t LED_PIN = LED_BUILTIN;
-// ---------------------------
-// Motion sleep pins/config
-// ---------------------------
-static constexpr uint8_t  MOTION_PIN     = D2;                 // XIAO D2
+static constexpr uint8_t  MOTION_PIN     = P1_06;
+static constexpr uint8_t VDD_RAIL_PIN = P1_13;
+
 //static constexpr uint32_t MOTION_IDLE_MS = 15UL * 60UL * 1000UL; // 15 minutes
 static constexpr uint32_t MOTION_IDLE_MS = 15UL * 1000UL; // 15 seconds
 
@@ -62,7 +73,7 @@ static volatile uint32_t g_last_motion_ms = 0;
 
 static constexpr uint16_t VBAT_MAX_MV     = 4200;
 static constexpr uint16_t VBAT_REPLACE_MV = 3600;   // adjust as desired
-static constexpr float    VBAT_SCALE      = 3.0f;   // calibrate if needed
+
 
 // ---------------------------
 // Packet format (4 bytes total)
@@ -84,12 +95,20 @@ static volatile uint8_t g_batt_health = 0;
 // ---------------------------
 static inline void battery_sense_init_safe()
 {
-  pinMode(VBAT_EN, OUTPUT);
-  digitalWrite(VBAT_EN, LOW);   // IMPORTANT: never drive HIGH
+  //pinMode(VBAT_EN, OUTPUT);  //xiao only 
+  //digitalWrite(VBAT_EN, LOW);   ///xiao only  IMPORTANT: never drive HIGH
   analogReadResolution(12);
 }
 
-static inline uint16_t read_battery_mv_safe()
+static inline uint16_t read_battery_mv_xiao_safe()
+{
+  uint16_t raw = analogRead(VBAT_ADC);       // 0..4095
+  float v_adc = (raw / 4095.0f) * 3.3f;      // volts at P0.31
+  float v_bat = v_adc * VBAT_SCALE;          // undo divider
+  return (uint16_t)(v_bat * 1000.0f + 0.5f); // mV
+}
+
+static inline uint16_t read_battery_mv_nicenano_safe()
 {
   uint16_t raw = analogRead(VBAT_ADC);       // 0..4095
   float v_adc = (raw / 4095.0f) * 3.3f;      // volts at P0.31
@@ -116,7 +135,7 @@ static inline uint8_t battery_health_from_mv(uint16_t mv)
 // Battery sampler ticker callback
 static void on_battery_sample_tick()
 {
-  uint16_t mv = read_battery_mv_safe();
+  uint16_t mv = read_battery_mv_nicenano_safe();
   g_batt_health = battery_health_from_mv(mv);
 
 #if PROGRAMMING_MODE
@@ -330,10 +349,13 @@ void setup()
     Serial.begin(UART_BAUD);
     wait_for_serial();
 #endif
-
+    pinMode(VDD_RAIL_PIN, OUTPUT);    //nicenano only 
+    digitalWrite(VDD_RAIL_PIN,HIGH);  //enable 3v3 rail
     battery_sense_init_safe();
     motion_init();
 
+
+    scan_adc_values();
     tx_packet.tag_id  = TAG_ID;
     tx_packet.seq     = 0;
     tx_packet.battery = 0;
@@ -365,7 +387,7 @@ void loop()
 
     // If no vibration for 15 minutes -> SYSTEMOFF
     if ((uint32_t)(millis() - g_last_motion_ms) > MOTION_IDLE_MS) {
-      go_to_system_off();
+      //go_to_system_off();
     }
 
 #if PROGRAMMING_MODE

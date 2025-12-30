@@ -4,7 +4,6 @@
 #include <HardwareSerial.h>
 #include <Ticker.h>
 #include <OneButton.h>
-#include <sys/time.h>   // gettimeofday
 
 #include "timesync.h"
 #include "config.h"
@@ -74,23 +73,27 @@ static SdUserReq g_sd_req = SdUserReq::NONE;
 static bool g_logging_paused = true;
 
 // ---------------------------
-// Time helpers
+// Mode helpers
 // ---------------------------
-static inline int64_t unix_now_ms() {
-    // System time; should track your RTC once RtcTime / settimeofday is applied.
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    return (int64_t)tv.tv_sec * 1000LL + (tv.tv_usec / 1000);
-}
-
-static inline bool rtc_time_valid() {
-    constexpr uint64_t MIN_VALID_UNIX_MS = 1577836800ULL * 1000ULL; // 2020-01-01
-    const uint64_t unix_ms = (uint64_t)unix_now_ms();
-    return unix_ms >= MIN_VALID_UNIX_MS;
-}
-
 static inline bool can_enter_race() {
-    return SdLogger::is_mounted() && rtc_time_valid();
+    return SdLogger::is_mounted() && RtcTime::rtc_time_valid_now();
+}
+
+static void enter_init_mode() {
+    if (g_mode == AppMode::INIT) return;
+
+    Log.noticeln(F("Entering INIT mode: stopping pass processing + logging"));
+    g_mode = AppMode::INIT;
+
+    // Hard stop immediately (don’t wait for loop gating)
+    g_logging_paused = true;
+
+    // Optional: reset UI to selfcheck baseline; ensures no stale race UI is shown
+    StatusDisplay::reset_selfcheck();   // If you don’t have this function, remove this line.
+
+    // Optional: reset pass detector state so you don't carry in-pass state back into a future race
+    pass_init();
+    pass_set_event_sink(on_event);
 }
 
 static void enter_race_mode() {
@@ -151,9 +154,8 @@ void on_event(const Event &e) {
     if (g_logging_paused) return;
 
     int64_t unix_ms = g_uart.unix_from_rel(e.rel_ms);
-
-    // If timebase isn't ready yet (should be rare), fall back to current time.
-    if (unix_ms == 0) unix_ms = unix_now_ms();
+    if (unix_ms == 0) unix_ms = RtcTime::unix_now_ms();
+    if (unix_ms <= 0) return;
 
     SdLogger::log_event((uint64_t)unix_ms, e);
     g_total_events++;
@@ -173,16 +175,16 @@ static void on_sample(uint32_t rel_ms, int64_t unix_ms, uint16_t tag_id, uint8_t
     if (g_mode != AppMode::RACE) return;
     if (g_logging_paused) return;
 
+    if (unix_ms <= 0) unix_ms = RtcTime::unix_now_ms();
+    if (unix_ms <= 0) return;
+
     TagContext *ctx = pass_get_ctx(tag_id);
     const uint32_t pass_id = (ctx && ctx->in_pass) ? ctx->pass_id : 0;
 
-    // Log raw sample using aligned unix_ms (NOT "now")
     SdLogger::log_raw_sample((uint64_t)unix_ms, rel_ms, tag_id, pass_id, rssi);
     g_total_samples++;
 
-    // Pass processor still wants wall clock for idle timeout behavior
-    const uint32_t now_wall_ms = millis();
-    pass_process_sample(rel_ms, tag_id, rssi, now_wall_ms);
+    pass_process_sample(rel_ms, tag_id, rssi, millis());
 }
 
 // ---------------------------
@@ -193,10 +195,11 @@ static void on_btn_click() {
 }
 
 static void on_btn_longpress_start() {
+    // Long press toggles mode
     if (g_mode == AppMode::INIT) {
         enter_race_mode();
     } else {
-        g_sd_req_isr = SdUserReq::REQ_UNMOUNT;
+        enter_init_mode();
     }
 }
 
@@ -213,9 +216,11 @@ void setup() {
     Log.begin(LOG_LEVEL_NOTICE, &Serial);
     Log.noticeln(F("ESP32 XC receiver starting..."));
 
+    // RTC init + seed system time BEFORE SD mount (prevents 1970 file timestamps)
     Log.error(F("Rtc:: "));
     RtcTime::init();
     Log.errorln(F("[OK]"));
+    RtcTime::seed_system_time_from_rtc();
 
     // Pass processor (initialized, but we won't feed it until RACE)
     pass_init();
@@ -223,8 +228,8 @@ void setup() {
 
     // UART reader
     g_uart.begin();
-    g_uart.set_unix_now_fn(unix_now_ms); // NEW
-    g_uart.set_callback(on_sample);      // NEW signature
+    g_uart.set_unix_now_fn(RtcTime::unix_now_ms);
+    g_uart.set_callback(on_sample);
 
     // OLED display
     Log.error(F("Display:: "));
@@ -240,7 +245,7 @@ void setup() {
     Log.noticeln(F("NTP: starting non-blocking sync attempt"));
     TimeSync::begin("bluedirt_IOT_2G", "allthethings!", 10000);
 
-    // Request mount at boot
+    // Request mount at boot (safe now because system time is seeded from RTC)
     Log.noticeln(F("SdLogger: requesting mount at boot"));
     SdLogger::mount();
 
@@ -258,7 +263,7 @@ void setup() {
 void loop() {
     g_btn.tick();
 
-    // Latch request from callback
+    // Latch request from ISR callback
     if (g_sd_req_isr != SdUserReq::NONE) {
         g_sd_req = g_sd_req_isr;
         g_sd_req_isr = SdUserReq::NONE;
@@ -269,7 +274,7 @@ void loop() {
         if (g_sd_req == SdUserReq::REQ_UNMOUNT) {
             Log.noticeln(F("SD: user requested UNMOUNT"));
             SdLogger::unmount();
-            g_logging_paused = true; // immediate
+            g_logging_paused = true;
         } else {
             Log.noticeln(F("SD: user requested MOUNT"));
             SdLogger::mount();
@@ -283,16 +288,17 @@ void loop() {
 
     TimeSync::service();
 
-    // If NTP finished successfully, set RTC once
+    // If NTP finished successfully, apply to system time + RTC once
     int64_t ntp_ms = 0;
     if (TimeSync::consume_success_time_ms(ntp_ms)) {
-        Log.noticeln(F("NTP: applying time to RTC"));
+        Log.noticeln(F("NTP: applying time to system + RTC"));
+        RtcTime::apply_system_time_ms(ntp_ms);
         RtcTime::set_from_unix_ms(ntp_ms);
     }
 
     // Decide if logging/pass processing should run
     if (g_mode == AppMode::RACE) {
-        g_logging_paused = !(g_sd_present && rtc_time_valid());
+        g_logging_paused = !(g_sd_present && RtcTime::rtc_time_valid_now());
     } else {
         g_logging_paused = true;
     }

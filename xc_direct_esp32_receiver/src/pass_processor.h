@@ -54,7 +54,7 @@ static volatile uint32_t g_passes_completed = 0;
 #endif
 
 #ifndef PASS_MIN_SEP_MS
-#define PASS_MIN_SEP_MS (20000u)           // optional extra separation between passes
+#define PASS_MIN_SEP_MS (5000u)           // optional extra separation between passes
 #endif
 
 // =====================================================

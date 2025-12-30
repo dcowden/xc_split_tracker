@@ -6,7 +6,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
-#include <sys/time.h>
 #include <ArduinoLog.h>
 
 namespace TimeSync {
@@ -42,17 +41,10 @@ namespace TimeSync {
     static constexpr time_t MIN_VALID_TIME = 1577836800; // 2020-01-01
 
     inline void wifi_cleanup() {
-        // Leave no WiFi running (you want battery + determinism)
         WiFi.disconnect(true /*wifioff*/, true /*eraseAP*/);
         WiFi.mode(WIFI_OFF);
         Log.noticeln(F("TimeSync: disconnected wifi"));
         delay(10);
-    }
-
-    inline int64_t unix_ms_now() {
-        struct timeval tv;
-        gettimeofday(&tv, nullptr);
-        return (int64_t)tv.tv_sec * 1000LL + (tv.tv_usec / 1000);
     }
 
     inline void reset_runtime() {
@@ -75,7 +67,7 @@ namespace TimeSync {
                       const char* ntp2 = "time.nist.gov",
                       const char* ntp3 = "time.google.com")
     {
-        // If already running, ignore (keeps behavior deterministic)
+        // If already running, ignore
         if (s_state != State::IDLE && s_state != State::DONE_OK && s_state != State::DONE_FAIL) return;
 
         s_ssid = ssid;
@@ -97,15 +89,11 @@ namespace TimeSync {
         s_start_ms = millis();
         s_deadline_ms = s_start_ms + s_timeout_ms;
 
-        // Known-good WiFi setup for "connect now, then shut off"
-        WiFi.persistent(false);       // don't write flash
+        WiFi.persistent(false);
         WiFi.setAutoReconnect(false);
         WiFi.mode(WIFI_STA);
-
-        // This can help on some networks where ESP32 sleep breaks initial connect
         WiFi.setSleep(false);
 
-        // Start from clean slate
         WiFi.disconnect(true, true);
         delay(20);
 
@@ -131,7 +119,6 @@ namespace TimeSync {
                     Log.noticeln(F("TimeSync: connected, starting NTP"));
                     s_state = State::START_NTP;
                 } else if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
-                    // Fast-fail states (still respect the timeout, but don't spin forever)
                     Log.warningln(F("TimeSync: connect failed / no ssid"));
                     s_state = State::CLEANUP;
                 }
@@ -139,7 +126,6 @@ namespace TimeSync {
             }
 
             case State::START_NTP: {
-                // Use TZ-aware NTP call (same as your old code)
                 configTzTime("EST5EDT,M3.2.0/2,M11.1.0/2", s_ntp1, s_ntp2, s_ntp3);
                 s_state = State::WAIT_TIME;
                 return;
@@ -147,8 +133,9 @@ namespace TimeSync {
 
             case State::WAIT_TIME: {
                 // Wait for system time to become "real"
-                if (time(nullptr) >= MIN_VALID_TIME) {
-                    s_result_ms = unix_ms_now();
+                time_t t = time(nullptr);
+                if (t >= MIN_VALID_TIME) {
+                    s_result_ms = (int64_t)t * 1000LL; // validated source, no gettimeofday dependency
                     s_success_latched = true;
                     s_success_consumed = false;
                     Log.noticeln(F("TimeSync: NTP OK"));
@@ -172,8 +159,8 @@ namespace TimeSync {
         switch (s_state) {
             case State::DONE_OK:   return 'Y';
             case State::DONE_FAIL: return 'X';
-            case State::IDLE:      return 'X'; // not attempted = looks like fail (change if you want)
-            default:               return '?'; // running
+            case State::IDLE:      return 'X';
+            default:               return '?';
         }
     }
 

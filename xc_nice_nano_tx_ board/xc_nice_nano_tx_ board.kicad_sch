@@ -1141,131 +1141,6 @@
 			)
 			(embedded_fonts no)
 		)
-		(symbol "power:+3V3"
-			(power)
-			(pin_numbers
-				(hide yes)
-			)
-			(pin_names
-				(offset 0)
-				(hide yes)
-			)
-			(exclude_from_sim no)
-			(in_bom yes)
-			(on_board yes)
-			(property "Reference" "#PWR"
-				(at 0 -3.81 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(property "Value" "+3V3"
-				(at 0 3.556 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-				)
-			)
-			(property "Footprint" ""
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(property "Datasheet" ""
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(property "Description" "Power symbol creates a global label with name \"+3V3\""
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(property "ki_keywords" "global power"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(symbol "+3V3_0_1"
-				(polyline
-					(pts
-						(xy -0.762 1.27) (xy 0 2.54)
-					)
-					(stroke
-						(width 0)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-				(polyline
-					(pts
-						(xy 0 2.54) (xy 0.762 1.27)
-					)
-					(stroke
-						(width 0)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-				(polyline
-					(pts
-						(xy 0 0) (xy 0 2.54)
-					)
-					(stroke
-						(width 0)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-			)
-			(symbol "+3V3_1_1"
-				(pin power_in line
-					(at 0 0 90)
-					(length 0)
-					(name "~"
-						(effects
-							(font
-								(size 1.27 1.27)
-							)
-						)
-					)
-					(number "1"
-						(effects
-							(font
-								(size 1.27 1.27)
-							)
-						)
-					)
-				)
-			)
-			(embedded_fonts no)
-		)
 		(symbol "power:GND"
 			(power)
 			(pin_numbers
@@ -1381,12 +1256,6 @@
 		(uuid "1384a8b0-aecc-4c89-9afb-c9d46deab5e1")
 	)
 	(junction
-		(at 54.61 81.28)
-		(diameter 0)
-		(color 0 0 0 0)
-		(uuid "25135e7e-4acb-4dfe-92fd-a0607dafae9c")
-	)
-	(junction
 		(at 86.36 58.42)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -1476,16 +1345,6 @@
 	)
 	(wire
 		(pts
-			(xy 54.61 85.09) (xy 54.61 81.28)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "51400a0f-ea49-4d90-a1c9-fd7d97d24164")
-	)
-	(wire
-		(pts
 			(xy 162.56 54.61) (xy 167.64 54.61)
 		)
 		(stroke
@@ -1493,16 +1352,6 @@
 			(type default)
 		)
 		(uuid "5d13e61b-12b6-4fce-9b98-bf4589cd3479")
-	)
-	(wire
-		(pts
-			(xy 54.61 77.47) (xy 54.61 81.28)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "677f0e6b-43b3-4f21-8824-7f2816ec7d25")
 	)
 	(wire
 		(pts
@@ -1563,16 +1412,6 @@
 			(type default)
 		)
 		(uuid "cdc153a1-1c36-4358-9007-90c460c68484")
-	)
-	(wire
-		(pts
-			(xy 54.61 81.28) (xy 57.15 81.28)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "d73f212a-2661-4e4b-b92b-09fc26a65eba")
 	)
 	(wire
 		(pts
@@ -1836,26 +1675,6 @@
 		(uuid "d9e595c7-86d8-481e-b2a6-892ed5c3ae08")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
 			(at 144.78 71.12 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-	)
-	(global_label "P0.29"
-		(shape bidirectional)
-		(at 57.15 81.28 0)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left)
-		)
-		(uuid "f3c6a6bf-b7bf-4515-a75a-d7465e4db5c6")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 57.15 81.28 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -2354,76 +2173,6 @@
 		)
 	)
 	(symbol
-		(lib_id "Device:R")
-		(at 54.61 73.66 0)
-		(unit 1)
-		(exclude_from_sim no)
-		(in_bom yes)
-		(on_board yes)
-		(dnp no)
-		(fields_autoplaced yes)
-		(uuid "64dcaa30-3076-46a8-acba-94bc1d6daeac")
-		(property "Reference" "R2"
-			(at 57.15 72.3899 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-			)
-		)
-		(property "Value" "470k"
-			(at 57.15 74.9299 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-			)
-		)
-		(property "Footprint" ""
-			(at 52.832 73.66 90)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Datasheet" "~"
-			(at 54.61 73.66 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Description" "Resistor"
-			(at 54.61 73.66 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(pin "2"
-			(uuid "83432767-b79b-47ca-bbb5-5ca642d8d0b1")
-		)
-		(pin "1"
-			(uuid "2199d9af-fddd-4fbb-9a4b-eccc4eb97fe3")
-		)
-		(instances
-			(project ""
-				(path "/cd6fa5eb-fabf-48d9-94ec-179e519f4c47"
-					(reference "R2")
-					(unit 1)
-				)
-			)
-		)
-	)
-	(symbol
 		(lib_id "Connector:Conn_01x01_Pin")
 		(at 172.72 88.9 0)
 		(unit 1)
@@ -2483,72 +2232,6 @@
 			(project "xc_nice_nano_tx_ board"
 				(path "/cd6fa5eb-fabf-48d9-94ec-179e519f4c47"
 					(reference "J3")
-					(unit 1)
-				)
-			)
-		)
-	)
-	(symbol
-		(lib_id "power:GND")
-		(at 54.61 92.71 0)
-		(unit 1)
-		(exclude_from_sim no)
-		(in_bom yes)
-		(on_board yes)
-		(dnp no)
-		(fields_autoplaced yes)
-		(uuid "6907fefe-4bef-4886-9a94-c3a310bc1fc7")
-		(property "Reference" "#PWR08"
-			(at 54.61 99.06 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Value" "GND"
-			(at 54.61 97.79 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-			)
-		)
-		(property "Footprint" ""
-			(at 54.61 92.71 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Datasheet" ""
-			(at 54.61 92.71 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 54.61 92.71 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(pin "1"
-			(uuid "96d853e7-7d39-4bf4-9a37-d97e58fff4af")
-		)
-		(instances
-			(project "xc_nice_nano_tx_ board"
-				(path "/cd6fa5eb-fabf-48d9-94ec-179e519f4c47"
-					(reference "#PWR08")
 					(unit 1)
 				)
 			)
@@ -2761,71 +2444,6 @@
 		)
 	)
 	(symbol
-		(lib_id "power:+3V3")
-		(at 54.61 69.85 0)
-		(unit 1)
-		(exclude_from_sim no)
-		(in_bom yes)
-		(on_board yes)
-		(dnp no)
-		(uuid "98976534-c889-436b-9f9b-71513cf1d8d7")
-		(property "Reference" "#PWR02"
-			(at 54.61 73.66 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Value" "+3V3"
-			(at 54.61 64.77 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-			)
-		)
-		(property "Footprint" ""
-			(at 54.61 69.85 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Datasheet" ""
-			(at 54.61 69.85 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Description" "Power symbol creates a global label with name \"+3V3\""
-			(at 54.61 69.85 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(pin "1"
-			(uuid "ab3e5f50-176c-40fd-b24e-6da0626a9c6f")
-		)
-		(instances
-			(project ""
-				(path "/cd6fa5eb-fabf-48d9-94ec-179e519f4c47"
-					(reference "#PWR02")
-					(unit 1)
-				)
-			)
-		)
-	)
-	(symbol
 		(lib_id "power:GND")
 		(at 162.56 59.69 0)
 		(unit 1)
@@ -2886,76 +2504,6 @@
 			(project ""
 				(path "/cd6fa5eb-fabf-48d9-94ec-179e519f4c47"
 					(reference "#PWR01")
-					(unit 1)
-				)
-			)
-		)
-	)
-	(symbol
-		(lib_id "Device:R")
-		(at 54.61 88.9 0)
-		(unit 1)
-		(exclude_from_sim no)
-		(in_bom yes)
-		(on_board yes)
-		(dnp no)
-		(fields_autoplaced yes)
-		(uuid "ccb31271-4e8f-428e-98e0-a073efe2d8e7")
-		(property "Reference" "R3"
-			(at 57.15 87.6299 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-			)
-		)
-		(property "Value" "470k"
-			(at 57.15 90.1699 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-			)
-		)
-		(property "Footprint" ""
-			(at 52.832 88.9 90)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Datasheet" "~"
-			(at 54.61 88.9 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Description" "Resistor"
-			(at 54.61 88.9 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(pin "2"
-			(uuid "8dd9475d-06b3-4846-9395-1cfadd9ae8ef")
-		)
-		(pin "1"
-			(uuid "666ff326-c38b-414b-aa1a-cc3e01378959")
-		)
-		(instances
-			(project "xc_nice_nano_tx_ board"
-				(path "/cd6fa5eb-fabf-48d9-94ec-179e519f4c47"
-					(reference "R3")
 					(unit 1)
 				)
 			)

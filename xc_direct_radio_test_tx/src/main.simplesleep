@@ -1,0 +1,128 @@
+#include <Arduino.h>
+#include <nrf.h>
+#include "Adafruit_TinyUSB.h"
+
+// =============================
+// Arduino pin numbers (per YOUR mapping header)
+//   P0.15 -> 15
+//   P1.06 -> 38
+// =============================
+static constexpr uint8_t LED_PIN  = 15;  // P0.15
+static constexpr uint8_t WAKE_PIN = 38;  // P1.06
+
+// Timing
+static constexpr uint32_t BLINK_MS       = 2000;
+static constexpr uint32_t SLEEP_AFTER_MS = 10000;
+
+static uint32_t t0_ms = 0;
+static uint32_t last_blink_ms = 0;
+
+// Interrupt flag
+static volatile bool g_wake_irq = false;
+
+static void on_wake_isr()
+{
+  g_wake_irq = true;
+}
+
+// =============================
+// Enter SYSTEMOFF with wake on P1.06 low
+// NOTE: SYSTEMOFF wake is configured via SENSE (nRF register),
+// but we still use Arduino pinMode/digitalWrite for everything else.
+// =============================
+static void go_to_system_off()
+{
+  Serial.println("Entering SYSTEMOFF...");
+  Serial.flush();
+
+  // Turn LED off
+  digitalWrite(LED_PIN, LOW);
+
+  // Configure wake source: P1.06 sense LOW
+  // WAKE_PIN is already the absolute nRF pin number in your mapping (38),
+  // so DON'T run it through g_ADigitalPinMap[].
+  nrf_gpio_cfg_sense_input(
+      (uint32_t)WAKE_PIN,
+      NRF_GPIO_PIN_PULLUP,     // or NRF_GPIO_PIN_NOPULL if you have external pull-up
+      NRF_GPIO_PIN_SENSE_LOW
+  );
+
+  // Enter SYSTEMOFF (wake causes reset)
+  NRF_POWER->SYSTEMOFF = 1;
+
+  __DSB();
+  __WFE();
+  while (1) { __WFE(); }
+}
+
+static void wait_for_serial(uint32_t ms = 2000)
+{
+  uint32_t t0 = millis();
+  while (!Serial && (millis() - t0) < ms) {
+    delay(10);
+  }
+}
+
+void setup()
+{
+  // Serial debug
+  Serial.begin(115200);
+  wait_for_serial();
+  Serial.println("\nBoot");
+
+  // LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Wake pin input (while awake)
+  pinMode(WAKE_PIN, INPUT_PULLUP);
+
+  // Interrupt whenever WAKE_PIN changes (or use FALLING if you only care about closures to GND)
+  int irq = digitalPinToInterrupt(WAKE_PIN);
+  Serial.print("WAKE_PIN=");
+  Serial.print(WAKE_PIN);
+  Serial.print(" digitalPinToInterrupt=");
+  Serial.println(irq);
+
+  if (irq >= 0) {
+    attachInterrupt(irq, on_wake_isr, CHANGE);
+    Serial.println("Interrupt attached.");
+  } else {
+    Serial.println("ERROR: digitalPinToInterrupt() returned NOT_AN_INTERRUPT.");
+  }
+
+  t0_ms = millis();
+  last_blink_ms = t0_ms;
+}
+
+void loop()
+{
+  uint32_t now = millis();
+
+  // Blink LED every second using Arduino API
+  if ((uint32_t)(now - last_blink_ms) >= BLINK_MS) {
+    last_blink_ms = now;
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+
+    Serial.print("t=");
+    Serial.print(now);
+    Serial.print(" LED=");
+    Serial.print(digitalRead(LED_PIN));
+    Serial.print(" WAKE_PIN=");
+    Serial.println(digitalRead(WAKE_PIN));
+  }
+
+  // Report interrupt events (from ISR flag)
+  if (g_wake_irq) {
+    g_wake_irq = false;
+    Serial.print("IRQ on WAKE_PIN! level=");
+    Serial.println(digitalRead(WAKE_PIN));
+  }
+
+  // Go to sleep after 10 seconds
+  if ((uint32_t)(now - t0_ms) >= SLEEP_AFTER_MS) {
+    go_to_system_off();
+  }
+
+  delay(1);
+}

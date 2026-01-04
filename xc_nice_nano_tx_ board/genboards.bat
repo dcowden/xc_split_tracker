@@ -70,7 +70,7 @@ REM edges.png    Run this at cutting power to cut edge and holes
 set PROG="C:\Program Files\KiCad\9.0\bin\kicad-cli"
 set SOURCE_FILE="xc_nice_nano_tx_ board.kicad_pcb"
 set OUT_FILE=".\board_art"
-set DPI="1200"
+set DPI="1000"
 set KERF_PX="6"
 
 

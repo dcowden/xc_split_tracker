@@ -1,0 +1,84 @@
+PCB: C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+OUT: C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2
+DPI: 1000  KERF_PX: 8
+kicad-cli: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe
+magick: C:\Program Files\ImageMagick-7.1.1\magick.EXE
+
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export dxf --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\cuts.dxf --layers Edge.Cuts,User.Drawings --output-units mm C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\cuts.dxf\xc_nice_nano_tx_ board-Edge_Cuts.dxf'.
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\cuts.dxf\xc_nice_nano_tx_ board-User_Drawings.dxf'.
+Done.
+
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export svg --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back.svg --black-and-white --theme KiCad Classic --layers B.Cu,Edge.Cuts --exclude-drawing-sheet --negative --mirror C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back.svg'.
+Done.
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE convert -density 1000 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back.svg C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back.png
+STDERR:
+WARNING: The convert command is deprecated in IMv7, use "magick" instead of "convert" or "magick convert"
+
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back.png -morphology Dilate Disk:8 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back_kerf.png
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export svg --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-back.svg --black-and-white --theme KiCad Classic --layers B.Mask,Edge.Cuts --exclude-drawing-sheet --mirror C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-back.svg'.
+Done.
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE convert -density 1000 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-back.svg C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-back.png
+STDERR:
+WARNING: The convert command is deprecated in IMv7, use "magick" instead of "convert" or "magick convert"
+
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-back.png -morphology Dilate Disk:8 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-back_kerf.png
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export svg --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front.svg --black-and-white --theme KiCad Classic --layers F.Cu,Edge.Cuts --exclude-drawing-sheet --negative C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front.svg'.
+Done.
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE convert -density 1000 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front.svg C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front.png
+STDERR:
+WARNING: The convert command is deprecated in IMv7, use "magick" instead of "convert" or "magick convert"
+
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front.png -morphology Dilate Disk:8 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front_kerf.png
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export svg --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-front.svg --black-and-white --theme KiCad Classic --layers F.Mask,Edge.Cuts --exclude-drawing-sheet C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-front.svg'.
+Done.
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE convert -density 1000 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-front.svg C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-front.png
+STDERR:
+WARNING: The convert command is deprecated in IMv7, use "magick" instead of "convert" or "magick convert"
+
+
+RUN: C:\Program Files\ImageMagick-7.1.1\magick.EXE C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-front.png -morphology Dilate Disk:8 C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\mask-front_kerf.png
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export dxf --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back-silkscreen.dxf --layers B.Silkscreen,Edge.Cuts --output-units mm C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back-silkscreen.dxf\xc_nice_nano_tx_ board-B_Silkscreen.dxf'.
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\back-silkscreen.dxf\xc_nice_nano_tx_ board-Edge_Cuts.dxf'.
+Done.
+
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export dxf --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front-silkscreen.dxf --layers F.Fab,Edge.Cuts --output-units mm C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front-silkscreen.dxf\xc_nice_nano_tx_ board-F_Fab.dxf'.
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art2\front-silkscreen.dxf\xc_nice_nano_tx_ board-Edge_Cuts.dxf'.
+Done.
+
+
+DONE.

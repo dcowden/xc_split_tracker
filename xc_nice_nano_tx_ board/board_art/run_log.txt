@@ -1,0 +1,16 @@
+PROJECT_DIR: C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board
+PCB: C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+OUT: C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art
+DPI: 1000  KERF_PX: 8
+kicad-cli: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe
+magick: C:\Program Files\ImageMagick-7.1.1\magick.EXE
+
+RUN: C:\Program Files\KiCad\9.0\bin\kicad-cli.exe pcb export dxf --output C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art\_edge_only_for_bbox.dxf --layers Edge.Cuts --output-units mm C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\xc_nice_nano_tx_ board.kicad_pcb
+STDOUT:
+[33;1mThis command has deprecated behavior as of KiCad 9.0, the default behavior of this command will change in a future release.[0m
+[33;1mThe new behavior will match --mode-multi[0m
+Plotted to 'C:\Users\davec\gitwork\xc_split_tracker\xc_nice_nano_tx_ board\board_art\_edge_only_for_bbox.dxf\xc_nice_nano_tx_ board-Edge_Cuts.dxf'.
+Done.
+
+
+FAILED: PermissionError(13, 'Permission denied')

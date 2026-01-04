@@ -6,7 +6,7 @@
 #include <nrf_gpio.h>
 
 #ifndef PROGRAMMING_MODE
-#define PROGRAMMING_MODE 1
+//#define PROGRAMMING_MODE 1
 #endif
 
 #if PROGRAMMING_MODE
@@ -23,15 +23,16 @@ static constexpr uint8_t  LED_PIN       = P0_15;
 static constexpr uint8_t  MOTION_PIN    = P1_06;
 static constexpr uint8_t  VDD_RAIL_PIN  = P1_13;
 
-#define TAG_ID          4
+#define TAG_ID          1
 #define TX_INTERVAL_MS  5
 
-//static constexpr uint32_t MOTION_IDLE_MS = 15UL * 60UL * 1000UL; // 15 minutes
-static constexpr uint32_t MOTION_IDLE_MS = 15UL * 1000UL; // 15 seconds (test)
 
 #if PROGRAMMING_MODE
   static constexpr uint32_t UART_BAUD = 115200;
   #define DEBUG_INTERVAL_MS 1000
+  static constexpr uint32_t MOTION_IDLE_MS = 15UL * 1000UL; // 15 seconds (test)
+  #else
+  static constexpr uint32_t MOTION_IDLE_MS = 15UL * 60UL * 1000UL; // 15 minutes
 #endif
 
 // ---------------------------
@@ -275,13 +276,18 @@ void loop()
 
   // Handle motion events (keep millis() out of ISR)
   if (g_motion_flag) {
+     
     g_motion_flag = false;
+    #if PROGRAMMING_MODE   
+   Serial.println("Got Wake Event..");
+   Serial.flush();
+    #endif
     g_last_motion_ms = millis();
   }
 
   // If no vibration -> SYSTEMOFF
   if ((uint32_t)(millis() - g_last_motion_ms) > MOTION_IDLE_MS) {
-    //go_to_system_off();
+    go_to_system_off();
   }
 
 #if PROGRAMMING_MODE

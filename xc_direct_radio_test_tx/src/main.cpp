@@ -23,7 +23,7 @@ static constexpr uint8_t  LED_PIN       = P0_15;
 static constexpr uint8_t  MOTION_PIN    = P1_06;
 static constexpr uint8_t  VDD_RAIL_PIN  = P1_13;
 
-#define TAG_ID          1
+#define TAG_ID          3
 #define TX_INTERVAL_MS  5
 
 

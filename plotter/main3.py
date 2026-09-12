@@ -33,10 +33,11 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore
 
 
-RAW_CSV_PATH = r"E:\raw_12_31_1969.csv"
-EVENTS_CSV_PATH = r"e:\events_12_31_1969.csv"
-# RAW_CSV_PATH = r"C:\gitwork\xc_split_tracker\data\raw-3x3 approaches-12-20-2025.csv"
-# EVENTS_CSV_PATH = r"e:\events.csv"
+#RAW_CSV_PATH = r"E:\raw_09_12_2026.csv"
+RAW_CSV_PATH = r"c:\temp\tracker\raw_09_12_2026.csv"
+#EVENTS_CSV_PATH = r"e:\events_12_31_1969.csv"
+#RAW_CSV_PATH = r"C:\gitwork\xc_split_tracker\data\raw-3x3 approaches-12-20-2025.csv"
+EVENTS_CSV_PATH = r"e:\events.csv"
 
 # -------------------------
 # Detector constants

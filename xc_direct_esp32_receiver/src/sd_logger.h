@@ -29,7 +29,7 @@ constexpr size_t RAW_RB_SECTORS = 16; // RingBuf size = 512 * sectors
 #endif
 
 #ifndef RAW_LOG_FILE_SIZE
-#define RAW_LOG_FILE_SIZE (128UL * 1024UL * 1024UL)
+#define RAW_LOG_FILE_SIZE 0
 #endif
 
 #ifndef EVENTS_FLUSH_INTERVAL_MS
@@ -80,7 +80,7 @@ constexpr uint8_t SD_SERVICE_MAX_RAW_BLOCKS = 8;
 // Public API
 // ============================================================
 
-inline bool  is_mounted();     // UI mounted: sd_ok + raw_ok + prealloc_ok
+inline bool  is_mounted();     // SD card initialized and ready for logging files
 inline bool  mount();          // request mount (non-blocking)
 inline void  unmount();        // immediate unmount
 inline void  service();        // call often from loop()
@@ -88,6 +88,8 @@ inline void  sync();           // bounded flush/drain
 
 inline void  log_raw_sample(uint64_t unix_ms, uint32_t rel_ms, uint16_t tag_id, uint32_t pass_id, int8_t rssi);
 inline void  log_event(uint64_t unix_ms, const Event &e);
+inline bool  raw_file_ready();
+inline void  set_raw_logging_led(bool on);
 
 inline uint32_t dropped_due_to_full();
 inline uint32_t dropped_events_due_to_queue_full();
@@ -138,8 +140,11 @@ static bool g_evt_ok          = false;
 static bool g_raw_prealloc_ok = false;
 
 static uint32_t g_last_evt_flush_ms   = 0;
+static uint32_t g_last_raw_sync_ms    = 0;
 static uint32_t g_next_retry_ms       = 0;     // when we may start/continue mounting
 static uint32_t g_mount_grace_until_ms= 0;     // small grace window before first attempt
+static bool     g_raw_led_initialized = false;
+static bool     g_raw_led_on          = false;
 
 // ============================================================
 // Event queue (RAM)
@@ -198,13 +203,19 @@ static inline bool rssi_sane(int r) { return (r >= SDLOG_RSSI_MIN && r <= SDLOG_
 #endif
 
 // ============================================================
-// Date-stamped filenames (set at mount time; no rotation)
+// Date/sequence-stamped filenames (set at mount time; no rotation)
 // ============================================================
 
 static char g_raw_path[32] = "/raw.csv";
 static char g_evt_path[32] = "/events.csv";
 
-static inline void format_paths_from_now() {
+static inline void format_paths_for_date_seq(int m, int d, int y, uint16_t seq) {
+  // raw_mm_dd_yyyy_nnn.csv, events_mm_dd_yyyy_nnn.csv
+  snprintf(g_raw_path, sizeof(g_raw_path), "/raw_%02d_%02d_%04d_%03u.csv",   m, d, y, (unsigned)seq);
+  snprintf(g_evt_path, sizeof(g_evt_path), "/events_%02d_%02d_%04d_%03u.csv", m, d, y, (unsigned)seq);
+}
+
+static inline bool choose_new_paths_from_now() {
   // Uses current system time (set this via NTP/RTC before SdLogger::mount()).
   time_t t = time(nullptr);
   struct tm tmv;
@@ -218,14 +229,32 @@ static inline void format_paths_from_now() {
   const int m = tmv.tm_mon + 1;
   const int d = tmv.tm_mday;
 
-  // raw_mm_dd_yyyy.csv, events_mm_dd_yyyy.csv
-  snprintf(g_raw_path, sizeof(g_raw_path), "/raw_%02d_%02d_%04d.csv",   m, d, y);
-  snprintf(g_evt_path, sizeof(g_evt_path), "/events_%02d_%02d_%04d.csv", m, d, y);
+  for (uint16_t seq = 1; seq <= 999; seq++) {
+    format_paths_for_date_seq(m, d, y, seq);
+    if (!g_sd.exists(g_raw_path) && !g_sd.exists(g_evt_path)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // ============================================================
 // Helpers
 // ============================================================
+
+static inline void raw_led_apply(bool on) {
+  const bool level = RAW_LOG_LED_ACTIVE_HIGH ? on : !on;
+  digitalWrite(RAW_LOG_LED_PIN, level ? HIGH : LOW);
+  g_raw_led_on = on;
+}
+
+static inline void raw_led_init_if_needed() {
+  if (g_raw_led_initialized) return;
+  pinMode(RAW_LOG_LED_PIN, OUTPUT);
+  g_raw_led_initialized = true;
+  raw_led_apply(false);
+}
 
 static inline void sd_bus_quiet() {
   pinMode(SD_CS_PIN, OUTPUT);
@@ -257,6 +286,8 @@ static inline void write_evt_header_if_empty() {
 }
 
 static inline void close_files_best_effort() {
+  set_raw_logging_led(false);
+
   if (g_raw_ok) {
     g_raw_rb.sync();
     g_raw_file.flush();
@@ -338,6 +369,8 @@ static inline void mount_step_reset() {
 }
 
 static inline void mount_begin_sequence(uint32_t now) {
+  set_raw_logging_led(false);
+
   // reset flags but DO NOT clear queued events
   g_sd_ok = g_raw_ok = g_evt_ok = false;
   g_raw_prealloc_ok = false;
@@ -404,48 +437,9 @@ static inline bool mount_stepper_once(uint32_t now) {
     }
 
     case MountStep::OPEN_FILES: {
-      // Set filenames once per mount.
-      // NOTE: this uses time(nullptr), so do NTP/RTC first, then mount().
-      format_paths_from_now();
-
-      // raw: fresh
-      if (!g_raw_file.open(g_raw_path, O_RDWR | O_CREAT | O_TRUNC)) {
-        sd_print_fail_detail("open raw_*");
-        g_raw_ok = false;
-      } else {
-        g_raw_ok = true;
-
-        g_raw_prealloc_ok = false;
-        if (RAW_LOG_FILE_SIZE > 0) {
-          if (!g_raw_file.preAllocate(RAW_LOG_FILE_SIZE)) {
-            Log.warningln(F("SdLogger: preAllocate(raw_*) FAILED (SD UI will show N)"));
-            g_raw_prealloc_ok = false;
-          } else {
-            g_raw_prealloc_ok = true;
-          }
-        } else {
-          g_raw_prealloc_ok = true;
-        }
-
-        write_raw_header_and_position();
-        g_raw_rb.begin(&g_raw_file);
-      }
-
-      // events: append
-      if (!g_evt_file.open(g_evt_path, O_RDWR | O_CREAT | O_AT_END)) {
-        sd_print_fail_detail("open events_*");
-        g_evt_ok = false;
-      } else {
-        g_evt_ok = true;
-        write_evt_header_if_empty();
-        g_last_evt_flush_ms = millis();
-      }
-
-      if (g_sd_ok && g_raw_ok && g_evt_ok) {
-        g_mstep = MountStep::DONE_OK;
-      } else {
-        g_mstep = MountStep::DONE_FAIL;
-      }
+      // Only mount the SD card here. Log files are created lazily on the
+      // first accepted raw sample so setup/init mounts do not consume a file.
+      g_mstep = g_sd_ok ? MountStep::DONE_OK : MountStep::DONE_FAIL;
       return false;
     }
 
@@ -476,7 +470,75 @@ static inline bool mount_stepper_once(uint32_t now) {
 // ============================================================
 
 inline bool is_mounted() {
-  return g_sd_ok && g_raw_ok && g_raw_prealloc_ok;
+  return g_state == SdState::LOGGING && g_sd_ok;
+}
+
+inline bool raw_file_ready() {
+  return g_state == SdState::LOGGING && g_sd_ok && g_raw_ok && g_raw_prealloc_ok;
+}
+
+inline void set_raw_logging_led(bool on) {
+  raw_led_init_if_needed();
+  const bool should_be_on = on && raw_file_ready();
+  if (should_be_on != g_raw_led_on) {
+    raw_led_apply(should_be_on);
+  }
+}
+
+static inline bool fault_after_log_file_open_failure() {
+  if (g_raw_file) g_raw_file.close();
+  if (g_evt_file) g_evt_file.close();
+
+  g_raw_ok = false;
+  g_evt_ok = false;
+  g_raw_prealloc_ok = false;
+  set_raw_logging_led(false);
+  set_state(SdState::FAULTED);
+  g_next_retry_ms = millis() + SD_REMOUNT_PERIOD_MS;
+  return false;
+}
+
+static inline bool open_log_files_for_raw_sample() {
+  if (raw_file_ready()) return true;
+  if (g_state != SdState::LOGGING || !g_sd_ok) return false;
+
+  if (!choose_new_paths_from_now()) {
+    Log.errorln(F("SdLogger: no free raw/events filename slots for today's date"));
+    return fault_after_log_file_open_failure();
+  }
+
+  // Create a new pair only; never truncate or append to an existing file.
+  if (!g_raw_file.open(g_raw_path, O_RDWR | O_CREAT | O_EXCL)) {
+    sd_print_fail_detail("open raw_*");
+    return fault_after_log_file_open_failure();
+  }
+
+  if (!g_evt_file.open(g_evt_path, O_RDWR | O_CREAT | O_EXCL)) {
+    sd_print_fail_detail("open events_*");
+    return fault_after_log_file_open_failure();
+  }
+
+  if (RAW_LOG_FILE_SIZE > 0 && !g_raw_file.preAllocate(RAW_LOG_FILE_SIZE)) {
+    Log.warningln(F("SdLogger: preAllocate(raw_*) FAILED"));
+    return fault_after_log_file_open_failure();
+  }
+
+  write_raw_header_and_position();
+  g_evt_file.println(F("unix_ms,rel_ms,tag_id,pass_id,event_type,rssi"));
+  g_evt_file.flush();
+
+  g_raw_rb.begin(&g_raw_file);
+  g_raw_ok = true;
+  g_evt_ok = true;
+  g_raw_prealloc_ok = true;
+  g_last_raw_sync_ms = millis();
+  g_last_evt_flush_ms = g_last_raw_sync_ms;
+
+#if SDLOG_DEBUG
+  Serial.printf("[SDLOG] log files opened files=(%s,%s)\n", g_raw_path, g_evt_path);
+#endif
+
+  return raw_file_ready();
 }
 
 inline bool mount() {
@@ -501,9 +563,9 @@ inline void log_raw_sample(uint64_t unix_ms,
                            uint16_t tag_id,
                            uint32_t pass_id,
                            int8_t rssi) {
-  (void)unix_ms; // filename set at mount time; unix_ms still logged in the CSV
-
-  if (g_state != SdState::LOGGING || !g_sd_ok || !g_raw_ok) return;
+  if (g_state != SdState::LOGGING || !g_sd_ok) return;
+  if (!open_log_files_for_raw_sample()) return;
+  set_raw_logging_led(true);
 
 #if SDLOG_DEBUG
   g_total_raw++;
@@ -617,7 +679,7 @@ inline void service() {
     while (blocks-- && g_raw_rb.bytesUsed() >= 512) {
       if (g_raw_file.isBusy()) break;
 
-      if (g_raw_prealloc_ok) {
+      if (RAW_LOG_FILE_SIZE > 0 && g_raw_prealloc_ok) {
         if (g_raw_file.curPosition() + 512 > (uint32_t)RAW_LOG_FILE_SIZE) break;
       }
 
@@ -629,6 +691,12 @@ inline void service() {
         g_next_retry_ms = now + SD_REMOUNT_PERIOD_MS;
         return;
       }
+    }
+
+    if (SD_SYNC_INTERVAL_MS > 0 && (now - g_last_raw_sync_ms) >= SD_SYNC_INTERVAL_MS && !g_raw_file.isBusy()) {
+      g_last_raw_sync_ms = now;
+      g_raw_rb.sync();
+      g_raw_file.flush();
     }
   }
 

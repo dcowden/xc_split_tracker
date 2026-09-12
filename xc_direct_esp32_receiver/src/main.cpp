@@ -22,12 +22,7 @@ void on_event(const Event &e);
 // ---------------------------
 // Runtime config
 // ---------------------------
-RuntimeConfig g_cfg = {
-    .ema_alpha       = 0.01f,
-    .threshold_dbm   = -100,
-    .hysteresis_db   = 2,
-    .idle_end_ms     = 1000,
-};
+RuntimeConfig g_cfg{};  // Defaults in session_detector.h match plotter/main5.py.
 
 TagContext g_tags[MAX_TAGS];
 volatile uint32_t g_total_events  = 0;  // passes (race only)
@@ -209,6 +204,7 @@ static void on_btn_longpress_start() {
 void setup() {
     Serial.begin(115200);
     delay(200);
+    SdLogger::set_raw_logging_led(false);
 
     setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1);
     tzset();
@@ -302,6 +298,7 @@ void loop() {
     } else {
         g_logging_paused = true;
     }
+    SdLogger::set_raw_logging_led(!g_logging_paused);
 
     // UART service (always)
     g_uart.service();

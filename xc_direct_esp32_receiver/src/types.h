@@ -13,7 +13,7 @@ struct Event {
     uint32_t  pass_id;
     uint16_t  tag_id;
     EventType type;
-    int8_t    rssi;     // for Start/End = current RSSI, for Peak = peak EMA rounded
+    int8_t    rssi;     // Start/End: raw RSSI; Peak: rounded median + EMA (raw fallback)
 };
 
 struct TagContext {
@@ -23,12 +23,7 @@ struct TagContext {
     bool     in_pass     = false;
     uint32_t pass_id     = 0;
 
-    // EMA state
-    bool     ema_init    = false;
-    float    ema         = 0.0f;
-
-    // Peak EMA during pass
-    float    peak_ema    = 0.0f;
+    // Peak timestamp during session
     uint32_t peak_rel_ms = 0;
 
     // Last sample bookkeeping
